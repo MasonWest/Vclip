@@ -1,0 +1,21 @@
+# Node.js
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Vite
+.vite/
+.output/
+
+# Environment Variables (关键：防止密钥泄露)
+.env
+.env.*
+!.env.example
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
