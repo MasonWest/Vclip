@@ -1,6 +1,15 @@
 import React, { useState, useEffect } from 'react';
 import { createClient } from '@supabase/supabase-js';
-import { Clipboard, Trash2, Link as LinkIcon, Check, Plus, Search } from 'lucide-react';
+import { Clipboard, Trash2, Check, Search } from 'lucide-react';
+import { motion, AnimatePresence } from 'framer-motion';
+
+interface Clip {
+  id: number;
+  content: string;
+  created_at: string;
+  expires_at: string;
+  type?: 'text' | 'file';
+}
 
 const supabase = createClient(
   import.meta.env.VITE_SUPABASE_URL,
@@ -8,9 +17,12 @@ const supabase = createClient(
 );
 
 export default function CloudClipboard() {
-  const [clips, setClips] = useState([]);
+  const currentPath = window.location.pathname.replace(/^\/|\/$/g, '').toLowerCase();
+  const secretPath = (import.meta.env.VITE_SECRET_PATH || '').replace(/^\/|\/$/g, '').toLowerCase();
+
+  const [clips, setClips] = useState<Clip[]>([]);
   const [input, setInput] = useState("");
-  const [copiedId, setCopiedId] = useState(null);
+  const [copiedId, setCopiedId] = useState<number | null>(null);
 
   const fetchClips = async () => {
     const { data, error } = await supabase
@@ -18,144 +30,131 @@ export default function CloudClipboard() {
       .select('*')
       .gt('expires_at', new Date().toISOString())
       .order('created_at', { ascending: false });
-
-    if (!error) setClips(data || []);
+    if (!error) setClips((data as Clip[]) || []);
   };
 
-  useEffect(() => {
-    fetchClips();
-  }, []);
+  useEffect(() => { fetchClips(); }, []);
 
-  const addClip = async (e) => {
+  const addClip = async (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key !== 'Enter' || !input.trim()) return;
-
     const newContent = input.trim();
     setInput("");
 
-    // 1. 乐观更新：本地直接插入一条临时记录
     const tempId = Date.now();
-    const newClip = {
+    const newClip: Clip = {
       id: tempId,
       content: newContent,
       created_at: new Date().toISOString(),
-      expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
+      expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+      type: 'text'
     };
+    
+    // 乐观更新：新记录从上方滑入
     setClips(prev => [newClip, ...prev].slice(0, 20));
-
-    // 2. 后台同步到 Supabase
-    const { data: currentClips } = await supabase.from('clips').select('id').order('created_at', { ascending: true });
-    if (currentClips && currentClips.length >= 20) {
-        await supabase.from('clips').delete().eq('id', currentClips[0].id);
-    }
     
     const { data, error } = await supabase.from('clips').insert([{ content: newContent }]).select();
-    
-    // 3. 校验并替换真实数据
-    if (!error && data) {
-      setClips(prev => prev.map(c => c.id === tempId ? data[0] : c));
+    if (!error && data?.[0]) {
+      setClips(prev => prev.map(c => c.id === tempId ? (data[0] as Clip) : c));
     } else {
-      fetchClips(); // 如果出错则回滚刷新
+      fetchClips();
     }
   };
 
-  const [deletingId, setDeletingId] = useState(null);
-
-  const deleteClip = async (id) => {
-    setDeletingId(id);
+  const deleteClip = async (id: number) => {
+    setClips(prev => prev.filter(c => c.id !== id));
     await supabase.from('clips').delete().eq('id', id);
-    fetchClips();
-    setTimeout(() => setDeletingId(null), 1000);
   };
 
-  const copyToClipboard = async (text, id) => {
+  const copyToClipboard = async (text: string, id: number) => {
     try {
-      if (navigator.clipboard && window.isSecureContext) {
-        await navigator.clipboard.writeText(text);
-      } else {
-        const textArea = document.createElement("textarea");
-        textArea.value = text;
-        document.body.appendChild(textArea);
-        textArea.select();
-        document.execCommand('copy');
-        document.body.removeChild(textArea);
-      }
+      await navigator.clipboard.writeText(text);
       setCopiedId(id);
       setTimeout(() => setCopiedId(null), 2000);
     } catch (err) {
-      console.error('复制失败:', err);
+      console.error(err);
     }
   };
 
+  if (currentPath !== secretPath) {
+    return <div className="flex h-screen items-center justify-center bg-[#030303] text-zinc-600 font-mono tracking-tighter">404 // NOT_FOUND</div>;
+  }
+
   return (
-    <div className="min-h-screen bg-[#0A0A0A] text-zinc-300 font-sans selection:bg-blue-500/30">
-      {/* 顶部搜索/输入框 - Raycast 风格 */}
-      <div className="sticky top-0 z-10 p-4 lg:p-8 bg-[#0A0A0A]/80 backdrop-blur-md">
-        <div className="max-w-2xl mx-auto relative group">
-          <div className="absolute inset-y-0 left-4 flex items-center pointer-events-none">
-            <Search size={18} className="text-zinc-500 group-focus-within:text-blue-400 transition-colors" />
-          </div>
+  <div className="min-h-screen bg-[#050505] text-zinc-300 font-sans selection:bg-indigo-500/30 overflow-x-hidden relative">
+    <div className="fixed inset-0 bg-grain pointer-events-none z-[1]" />
+    <div className="fixed inset-0 z-0 pointer-events-none">
+      <div className="absolute top-[-10%] left-[-10%] w-[50%] h-[50%] bg-indigo-700/25 rounded-full blur-[120px]" />
+      <div className="absolute bottom-[5%] right-[-5%] w-[40%] h-[40%] bg-blue-700/20 rounded-full blur-[100px]" />
+      <div className="absolute inset-0" style={{ background: 'radial-gradient(ellipse at center, transparent 0%, rgba(8,8,8,0.5) 50%, #050505 100%)' }} />
+    </div>
+
+    <div className="relative z-10">
+      <div className="sticky top-0 z-50 pt-8 pb-4 px-6 bg-[#050505]/40 backdrop-blur-2xl border-b border-white/[0.03]">
+        <div className="max-w-xl mx-auto relative group">
           <input
             type="text"
-            placeholder="Command + K 或输入内容粘贴..."
-            className="w-full bg-[#121212] border border-zinc-800 rounded-xl py-4 pl-12 pr-4 text-zinc-100 focus:outline-none focus:border-zinc-600 focus:ring-1 focus:ring-zinc-600 transition-all shadow-2xl"
+            placeholder="粘贴并回车同步..."
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={addClip}
+            className="w-full bg-white/[0.03] border border-white/10 rounded-2xl py-4 px-12 text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500/40 transition-all shadow-[0_0_30px_rgba(0,0,0,0.5)]"
           />
+          <Search className="absolute left-4 top-1/2 -translate-y-1/2 text-zinc-500 group-focus-within:text-indigo-400 transition-colors" size={18} />
         </div>
       </div>
 
-      {/* 剪贴板列表 */}
-      <main className="max-w-2xl mx-auto px-4 pb-20 space-y-3">
-        {clips.map((clip) => (
-          <div 
-            key={clip.id}
-            className={`group relative bg-[#121212] border border-zinc-800/50 rounded-xl p-4 hover:border-zinc-600 transition-all duration-300 ${deletingId === clip.id ? 'opacity-20 scale-95' : 'opacity-100'}`}
-          >
-            <div className="flex items-start justify-between gap-4">
-              <div className="flex-1 min-w-0">
-                {/* 内容预览 */}
-                {clip.type === 'file' ? (
-                  <div className="flex items-center gap-2 text-blue-400 hover:underline cursor-pointer">
-                    <LinkIcon size={16} />
-                    <span className="truncate text-sm font-medium">{clip.content}</span>
+      <main className="max-w-xl mx-auto px-6 py-8">
+        <div className="space-y-4">
+          <AnimatePresence mode='popLayout' initial={false}>
+            {clips.map((clip) => (
+              <motion.div 
+                key={clip.id}
+                layout
+                initial={{ opacity: 0, y: -20, scale: 0.95 }}
+                animate={{ opacity: 1, y: 0, scale: 1 }}
+                exit={{ opacity: 0, scale: 0.95, transition: { duration: 0.2 } }}
+                transition={{ type: "spring", stiffness: 350, damping: 25, layout: { duration: 0.3 } }}
+                className="group relative"
+              >
+                <div className="bg-white/[0.04] backdrop-blur-xl border border-white/[0.08] rounded-2xl p-5 hover:bg-white/[0.07] hover:border-white/[0.14] transition-all duration-300 shadow-xl overflow-hidden">
+                  <div className="absolute top-0 left-0 right-0 h-[1px] bg-gradient-to-r from-transparent via-white/[0.05] to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
+
+                  <div className="flex flex-col gap-3">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <div className="w-1.5 h-1.5 rounded-full bg-indigo-500/80" />
+                        <span className="text-[10px] font-mono text-zinc-500 tracking-widest uppercase">
+                          {new Date(clip.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                        </span>
+                      </div>
+                      
+                      <div className="flex items-center gap-1.5">
+                        <button 
+                          onClick={() => copyToClipboard(clip.content, clip.id)}
+                          className="p-2 bg-white/[0.02] border border-white/5 rounded-xl text-zinc-400 hover:text-white hover:bg-white/[0.08] transition-all"
+                        >
+                          {copiedId === clip.id ? <Check size={14} className="text-green-500" /> : <Clipboard size={14} />}
+                        </button>
+                        <button 
+                          onClick={() => deleteClip(clip.id)}
+                          className="p-2 bg-red-500/5 border border-red-500/10 rounded-xl text-zinc-500 hover:text-red-400 hover:bg-red-500/10 transition-all"
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="min-w-0 pr-4 text-sm leading-relaxed text-zinc-300 font-light selection:bg-indigo-500/50 break-words whitespace-pre-wrap">
+                      {clip.content}
+                    </div>
                   </div>
-                ) : (
-                  <p className="text-sm leading-relaxed text-zinc-300 break-words line-clamp-6">
-                    {deletingId === clip.id ? <span className="text-red-500 italic">正在删除...</span> : clip.content}
-                  </p>
-                )}
-                <div className="flex items-center justify-between mt-2">
-                  <span className="text-[10px] text-zinc-600 uppercase tracking-widest">
-                    {new Date(clip.created_at).toLocaleTimeString()}
-                  </span>
-                  {copiedId === clip.id && (
-                    <span className="text-[10px] text-blue-500 font-medium animate-pulse">已复制</span>
-                  )}
                 </div>
-              </div>
-
-              {/* 操作按钮组 - 增加触控面积 */}
-              <div className="flex items-center gap-2 opacity-100 lg:opacity-0 group-hover:opacity-100 transition-opacity">
-                <button 
-                  onClick={() => copyToClipboard(clip.content, clip.id)}
-                  className="p-4 bg-zinc-800/50 lg:bg-transparent rounded-xl text-zinc-300 hover:text-white transition-colors active:scale-90"
-                >
-                  {copiedId === clip.id ? <Check size={20} className="text-green-500" /> : <Clipboard size={20} />}
-                </button>
-                <button 
-                  onClick={() => deleteClip(clip.id)}
-                  className={`p-4 bg-red-950/20 lg:bg-transparent rounded-xl transition-colors active:scale-90 ${deletingId === clip.id ? 'text-red-500 animate-pulse' : 'text-red-400 hover:text-red-500'}`}
-                >
-                  <Trash2 size={20} />
-                </button>
-              </div>
-            </div>
-          </div>
-        ))}
+              </motion.div>
+            ))}
+          </AnimatePresence>
+        </div>
       </main>
-
-      {/* 移除浮动按钮 */}
     </div>
+  </div>
   );
 }

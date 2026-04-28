@@ -1,11 +1,10 @@
-﻿# Send text into VR instantly
-# Vclip
+﻿# Vclip
 
-A minimal clipboard designed for VR users.
+A high-performance, aesthetically pleasing cloud clipboard designed for seamless text transfer across devices.
 
 ## 🧠 Why Vclip?
 
-Typing or transferring text inside VR is painful.
+Typing or transferring text inside VR (or between any devices) is painful.
 
 - No easy copy-paste
 - No quick way to send links
@@ -19,12 +18,20 @@ Copy instantly.
 
 No login. No setup. Just works.
 
+## 🛡️ Protection Mechanism
+
+Vclip includes a "Secret Path" protection layer. The application is only accessible via a custom URL suffix. If the URL doesn't match your secret path, the application will return a 404 page.
+
+Example: If your secret path is `my-tool`, access it via `https://your-domain.com/my-tool`.
+
 ## 部署说明
+
 1. **环境准备**：克隆项目并安装依赖 `npm install`。
-2. **配置**：在根目录创建 `.env` 文件，填入你的 Supabase 配置：
+2. **配置**：在根目录创建 `.env` 文件，填入你的 Supabase 和安全配置：
    ```env
    VITE_SUPABASE_URL=你的项目地址
    VITE_SUPABASE_ANON_KEY=你的匿名API密钥
+   VITE_SECRET_PATH=你的自定义入口路径 (例如: my-private-space)
    ```
 3. **数据库初始化**：在 Supabase SQL Editor 中执行以下语句创建数据表：
    ```sql
@@ -38,4 +45,8 @@ No login. No setup. Just works.
 4. **运行**：`npm run dev`
 
 ## 设计理念
-Vclip 的目标不是成为功能大而全的工具，而是通过“输入即同步，点击即复制，无感知删除”的闭环，解决个人开发者在多设备间快速传递文本或代码片段的痛点。
+
+Vclip 采用 **Raycast 风格** 的极简设计，结合 **Framer Motion** 的流畅动效，追求极致的交互手感：
+- **噪点质感背景**：消除死黑，增加高级感。
+- **乐观 UI 更新**：发送即上屏，后台同步，无需等待。
+- **隐私路径**：自定义入口，增加简单有效的安全防护。
