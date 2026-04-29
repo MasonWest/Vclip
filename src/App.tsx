@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { createClient } from '@supabase/supabase-js';
 import { Clipboard, Trash2, Check, Search } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -23,6 +23,7 @@ export default function CloudClipboard() {
   const [clips, setClips] = useState<Clip[]>([]);
   const [input, setInput] = useState("");
   const [copiedId, setCopiedId] = useState<number | null>(null);
+  const copyTimerRef = useRef<number | null>(null);
 
   const fetchClips = async () => {
     const { data, error } = await supabase
@@ -65,13 +66,51 @@ export default function CloudClipboard() {
     await supabase.from('clips').delete().eq('id', id);
   };
 
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current);
+      }
+    };
+  }, []);
+
+  const fallbackCopyText = (text: string) => {
+    const textArea = document.createElement('textarea');
+    textArea.value = text;
+    textArea.setAttribute('readonly', 'true');
+    textArea.style.position = 'fixed';
+    textArea.style.top = '-9999px';
+    textArea.style.left = '-9999px';
+    textArea.style.opacity = '0';
+    document.body.appendChild(textArea);
+    textArea.focus();
+    textArea.select();
+
+    const success = document.execCommand('copy');
+    document.body.removeChild(textArea);
+
+    if (!success) {
+      throw new Error('document.execCommand("copy") failed');
+    }
+  };
+
   const copyToClipboard = async (text: string, id: number) => {
     try {
-      await navigator.clipboard.writeText(text);
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        fallbackCopyText(text);
+      }
       setCopiedId(id);
-      setTimeout(() => setCopiedId(null), 2000);
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current);
+      }
+      copyTimerRef.current = window.setTimeout(() => {
+        setCopiedId(null);
+        copyTimerRef.current = null;
+      }, 2000);
     } catch (err) {
-      console.error(err);
+      console.error('复制失败:', err);
     }
   };
 
@@ -129,7 +168,9 @@ export default function CloudClipboard() {
                       </div>
                       
                       <div className="flex items-center gap-1.5">
-                        <button 
+                        <button
+                          type="button"
+                          aria-label="复制"
                           onClick={() => copyToClipboard(clip.content, clip.id)}
                           className="p-2 bg-white/[0.02] border border-white/5 rounded-xl text-zinc-400 hover:text-white hover:bg-white/[0.08] transition-all"
                         >
