@@ -1,7 +1,7 @@
 import { createServer } from 'node:http';
 import { createReadStream, existsSync, statSync, mkdirSync, appendFileSync, readFileSync } from 'node:fs';
 import { extname, join, resolve, normalize, sep } from 'node:path';
-import mysql from 'mysql2/promise';
+import { DatabaseSync } from 'node:sqlite';
 
 function loadEnvFile(filePath) {
   if (!existsSync(filePath)) return;
@@ -29,43 +29,71 @@ function loadEnvFile(filePath) {
   }
 }
 
-function loadMysqlEnv() {
-  const filePath = resolve(process.cwd(), 'mysql.env');
-  if (!existsSync(filePath)) return {};
-  const content = readFileSync(filePath, 'utf8');
-  const env = {};
-  for (const rawLine of content.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith('#')) continue;
-    const separatorIndex = line.indexOf('=');
-    if (separatorIndex === -1) continue;
-    const key = line.slice(0, separatorIndex).trim();
-    let value = line.slice(separatorIndex + 1).trim();
-    if (
-      (value.startsWith('"') && value.endsWith('"')) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
-      value = value.slice(1, -1);
+loadEnvFile(resolve(process.cwd(), '.env'));
+
+const dataDir = resolve(process.cwd(), 'data');
+mkdirSync(dataDir, { recursive: true });
+
+const dbPath = process.env.DB_PATH
+  ? resolve(process.cwd(), process.env.DB_PATH)
+  : join(dataDir, 'vclip.db');
+
+const db = new DatabaseSync(dbPath);
+
+db.exec('PRAGMA journal_mode = WAL');
+db.exec('PRAGMA synchronous = NORMAL');
+db.exec('PRAGMA busy_timeout = 5000');
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS clips (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    content    TEXT NOT NULL,
+    type       TEXT NOT NULL DEFAULT 'text',
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    expires_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+1 day'))
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_clips_expires_at ON clips (expires_at);
+`);
+
+const statements = {
+  list: db.prepare(`
+    SELECT id, content, type, created_at, expires_at
+    FROM clips
+    WHERE expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    ORDER BY id DESC
+    LIMIT 100
+  `),
+  insert: db.prepare(`
+    INSERT INTO clips (content)
+    VALUES (?)
+    RETURNING id, content, type, created_at, expires_at
+  `),
+  remove: db.prepare('DELETE FROM clips WHERE id = ?'),
+  purge: db.prepare(`
+    DELETE FROM clips
+    WHERE expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+  `),
+};
+
+const MAX_CONTENT_LENGTH = 1024 * 1024;
+const PURGE_INTERVAL_MS = 10 * 60 * 1000;
+
+function purgeExpiredClips(reason) {
+  try {
+    const info = statements.purge.run();
+    if (info.changes > 0) {
+      console.log(`[Cleanup] Removed ${info.changes} expired clip(s) [${reason}]`);
     }
-    env[key] = value;
+  } catch (err) {
+    console.error('[Cleanup] Failed to purge expired clips:', err);
   }
-  return env;
 }
 
-loadEnvFile(resolve(process.cwd(), '.env'));
-const mysqlEnv = loadMysqlEnv();
+purgeExpiredClips('startup');
 
-const dbPool = mysql.createPool({
-  host: mysqlEnv.url || 'localhost',
-  port: Number(mysqlEnv.port || 3306),
-  user: mysqlEnv.username || 'root',
-  password: mysqlEnv.password || '',
-  database: mysqlEnv.db_name || 'supabase',
-  timezone: 'Z',
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0,
-});
+const purgeTimer = setInterval(() => purgeExpiredClips('interval'), PURGE_INTERVAL_MS);
+purgeTimer.unref();
 
 const port = Number(process.env.PORT || 4173);
 const rootDir = resolve(process.cwd(), 'dist');
@@ -199,15 +227,12 @@ async function handleClipsApi(req, res, urlPath) {
     const method = req.method;
 
     if (method === 'GET' && urlPath === '/api/clips') {
-      console.log(`[API] GET /api/clips - Starting database query...`);
       try {
-        const [rows] = await dbPool.query(
-          'SELECT * FROM clips ORDER BY id DESC LIMIT 100'
-        );
-        console.log(`[API] GET /api/clips - Successfully retrieved ${rows.length} clips`);
+        const rows = statements.list.all();
+        console.log(`[API] GET /api/clips - Retrieved ${rows.length} clip(s)`);
         sendJSON(res, 200, rows);
       } catch (dbError) {
-        console.error(`[API] GET /api/clips - Database error:`, dbError);
+        console.error('[API] GET /api/clips - Database error:', dbError);
         sendJSON(res, 500, { error: 'Database query failed' });
       }
       return;
@@ -220,27 +245,19 @@ async function handleClipsApi(req, res, urlPath) {
         sendJSON(res, 400, { error: 'Content is required' });
         return;
       }
-      
+
+      const trimmed = content.trim();
+      if (trimmed.length > MAX_CONTENT_LENGTH) {
+        sendJSON(res, 413, { error: 'Content too large' });
+        return;
+      }
+
       try {
-        const [result] = await dbPool.execute(
-          'INSERT INTO clips (content, created_at, expires_at) VALUES (?, UTC_TIMESTAMP(), UTC_TIMESTAMP() + INTERVAL 1 DAY)',
-          [content.trim()]
-        );
-        
-        const insertId = result.insertId;
-        const [rows] = await dbPool.execute(
-          'SELECT id, content, created_at, expires_at, type FROM clips WHERE id = ?',
-          [insertId]
-        );
-        
-        if (rows && rows.length > 0) {
-          console.log(`[API] POST /api/clips - Successfully inserted clip ID: ${insertId}`);
-          sendJSON(res, 201, rows[0]);
-        } else {
-          sendJSON(res, 500, { error: 'Failed to retrieve inserted clip' });
-        }
+        const row = statements.insert.get(trimmed);
+        console.log(`[API] POST /api/clips - Successfully inserted clip ID: ${row.id}`);
+        sendJSON(res, 201, row);
       } catch (postError) {
-        console.error(`[API] POST /api/clips - Database error:`, postError);
+        console.error('[API] POST /api/clips - Database error:', postError);
         sendJSON(res, 500, { error: 'Internal server error' });
       }
       return;
@@ -248,14 +265,20 @@ async function handleClipsApi(req, res, urlPath) {
 
     if (method === 'DELETE' && urlPath.startsWith('/api/clips/')) {
       const idStr = urlPath.slice('/api/clips/'.length);
-      const id = parseInt(idStr, 10);
-      if (isNaN(id)) {
+      const id = Number(idStr);
+      if (!Number.isInteger(id) || id <= 0) {
         sendJSON(res, 400, { error: 'Invalid ID' });
         return;
       }
 
-      await dbPool.execute('DELETE FROM clips WHERE id = ?', [id]);
-      sendJSON(res, 200, { success: true });
+      try {
+        const info = statements.remove.run(id);
+        console.log(`[API] DELETE /api/clips/${id} - Removed ${info.changes} row(s)`);
+        sendJSON(res, 200, { success: true, deleted: info.changes });
+      } catch (deleteError) {
+        console.error(`[API] DELETE /api/clips/${id} - Database error:`, deleteError);
+        sendJSON(res, 500, { error: 'Internal server error' });
+      }
       return;
     }
 
@@ -269,21 +292,15 @@ async function handleClipsApi(req, res, urlPath) {
 const server = createServer((req, res) => {
   const requestUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
   const urlPath = decodeURIComponent(requestUrl.pathname);
-  
-  // [DEBUG] 追踪所有请求入口
-  console.log(`[Request] ${req.method} ${urlPath}`);
-  
+
   res.on('finish', () => logAccess(req, urlPath, res.statusCode));
 
   if (!requireAccessPassword(req, res)) {
     console.log(`[Auth] Request to ${urlPath} failed authentication`);
     return;
   }
-  
-  console.log(`[Auth] Request to ${urlPath} authenticated`);
 
   if (urlPath === '/api/clips' || urlPath.startsWith('/api/clips/')) {
-    console.log(`[Route] Routing ${urlPath} to handleClipsApi`);
     handleClipsApi(req, res, urlPath);
     return;
   }
@@ -335,5 +352,20 @@ const server = createServer((req, res) => {
 
 server.listen(port, () => {
   console.log(`Vclip server running on http://localhost:${port}`);
+  console.log(`SQLite database: ${dbPath}`);
   console.log(`Access logs: ${join(logDir, 'access-YYYY-MM-DD.log')}`);
 });
+
+function shutdown(signal) {
+  console.log(`\n[Shutdown] Received ${signal}, closing database...`);
+  try {
+    statements.purge.run();
+    db.close();
+  } catch (err) {
+    console.error('[Shutdown] Failed to close database cleanly:', err);
+  }
+  process.exit(0);
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
