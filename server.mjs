@@ -183,6 +183,43 @@ function getClientIp(req) {
   return remoteAddress.replace(/^::ffff:/, '') || 'unknown';
 }
 
+// ---------------------------------------------------------------------------
+// 局域网免密
+//
+// VR 头显、手机这类设备打字成本极高。开启后，来自局域网私有地址的请求
+// 直接放行，不需要密码也不需要入口路径，头显里存一个 http://IP:端口 书签即用。
+//
+// 刻意只采信 socket 地址，不读 X-Forwarded-For：该请求头可被客户端伪造，
+// 若采信它，任何能连上端口的人加个头就能冒充局域网。
+// ---------------------------------------------------------------------------
+const lanFreeAccess = (process.env.LAN_FREE_ACCESS || '').toLowerCase() === 'true';
+
+function getSocketIp(req) {
+  const remoteAddress = req.socket.remoteAddress || '';
+  return remoteAddress.replace(/^::ffff:/, '');
+}
+
+function isPrivateAddress(ip) {
+  if (!ip) return false;
+  if (ip === '127.0.0.1' || ip === '::1') return true;
+  if (ip.startsWith('10.')) return true;
+  if (ip.startsWith('192.168.')) return true;
+  if (ip.startsWith('169.254.')) return true;
+
+  const match = ip.match(/^172\.(\d{1,3})\./);
+  if (match) {
+    const second = Number(match[1]);
+    return second >= 16 && second <= 31;
+  }
+
+  return false;
+}
+
+function isLanTrusted(req) {
+  if (!lanFreeAccess) return false;
+  return isPrivateAddress(getSocketIp(req));
+}
+
 function getLocalDateStamp(date = new Date()) {
   const year = date.getFullYear();
   const month = String(date.getMonth() + 1).padStart(2, '0');
@@ -592,7 +629,9 @@ const server = createServer((req, res) => {
     return;
   }
 
-  if (!isAuthenticated(req)) {
+  const lanTrusted = isLanTrusted(req);
+
+  if (!lanTrusted && !isAuthenticated(req)) {
     // 一次性登录链接：手机首次访问时带上 ?k=xxx，免去在小屏上敲密码
     const loginParam = requestUrl.searchParams.get('k');
     if (loginParam && loginKey && safeEqual(loginParam, loginKey)) {
@@ -622,7 +661,7 @@ const server = createServer((req, res) => {
     return;
   }
 
-  if (!matchesSecretPath(urlPath)) {
+  if (!lanTrusted && !matchesSecretPath(urlPath)) {
     console.log(`[Security] Blocked ${urlPath} (secret path mismatch)`);
     sendNotFoundPage(res);
     return;
@@ -697,6 +736,16 @@ server.listen(port, () => {
     for (const address of getLanAddresses()) {
       console.log(`   LAN: http://${address}:${port}/${secretPath}`);
     }
+  }
+
+  if (lanFreeAccess) {
+    console.log('');
+    console.log('局域网免密已开启 —— 同网段设备直接访问，无需密码和入口路径:');
+    for (const address of getLanAddresses()) {
+      console.log(`   http://${address}:${port}/`);
+    }
+    console.log('VR 头显把这个地址存成书签即可，零输入进入。');
+    console.log('非局域网来源（公网）仍需密码 + 入口路径。');
   }
 
   if (accessPassword) {
