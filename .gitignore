@@ -13,6 +13,15 @@ dist-ssr/
 .env.*
 !.env.example
 
+# 公司 MySQL 连接配置（含凭据，禁止入库）
+mysql.env
+
+# 本地 SQLite 数据文件
+data/
+*.db
+*.db-wal
+*.db-shm
+
 # IDE & OS
 .vscode/
 .idea/
