@@ -20,18 +20,20 @@ No login. No setup. Just works.
 
 ## 🛡️ Protection Mechanism
 
-Vclip includes a "Secret Path" protection layer. The application is only accessible via a custom URL suffix. If the URL doesn't match your secret path, the application will return a 404 page.
+Vclip includes a "Secret Path" protection layer. The application is only accessible via a custom URL suffix. If the URL doesn't match your secret path, the server returns a 404 page.
 
 Example: If your secret path is `my-tool`, access it via `https://your-domain.com/my-tool`.
 
-此外，服务端还提供 HTTP Basic Auth 保护，页面和 API 都需要通过鉴权才能访问。
+该校验在**服务端**完成：路径不匹配直接返回 404，连 `index.html` 都不会吐出去。因此 secret path 不会被编译进前端 JS，别人下载 bundle 也看不到入口。
+
+此外，服务端还提供 HTTP Basic Auth 保护，页面和 API 都需要通过鉴权才能访问。两层叠加：先过 Basic Auth，再过 secret path。
 
 ## 部署说明
 
 1. **环境准备**：克隆项目并安装依赖 `npm install`。
 2. **配置**：在根目录创建 `.env` 文件：
    ```env
-   VITE_SECRET_PATH=你的自定义入口路径 (例如: my-private-space)
+   SECRET_PATH=你的自定义入口路径 (例如: my-private-space)
    ACCESS_PASSWORD=你的访问密码
    # 以下为可选项
    PORT=4173
@@ -42,6 +44,10 @@ Example: If your secret path is `my-tool`, access it via `https://your-domain.co
 5. **启动本地服务**：`npm run serve`
 
 启动后，浏览器会弹出 Basic Auth 密码框，输入 `ACCESS_PASSWORD` 才能访问页面。
+
+### Windows 一键启动
+
+双击 `启动vclip.bat` 即可。脚本会自动定位 Node.js —— 系统 PATH 里找不到时，会回退到 WorkBuddy 内置的 Node 运行时；若缺少 `node_modules` 或 `dist`，会自动安装依赖并构建前端。
 
 ### 开发模式
 

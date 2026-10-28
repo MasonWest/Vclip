@@ -11,9 +11,6 @@ interface Clip {
 }
 
 export default function CloudClipboard() {
-  const currentPath = window.location.pathname.replace(/^\/|\/$/g, '').toLowerCase();
-  const secretPath = (import.meta.env.VITE_SECRET_PATH || '').replace(/^\/|\/$/g, '').toLowerCase();
-
   const [clips, setClips] = useState<Clip[]>([]);
   const [input, setInput] = useState('');
   const [copiedId, setCopiedId] = useState<number | null>(null);
@@ -127,14 +124,6 @@ export default function CloudClipboard() {
       console.error('复制失败:', err);
     }
   };
-
-  if (currentPath !== secretPath) {
-    return (
-      <div className="flex h-screen items-center justify-center bg-[#030303] text-zinc-600 font-mono tracking-tighter">
-        404 // NOT_FOUND
-      </div>
-    );
-  }
 
   return (
     <div className="min-h-screen bg-[#050505] text-zinc-300 font-sans selection:bg-indigo-500/30 overflow-x-hidden relative">

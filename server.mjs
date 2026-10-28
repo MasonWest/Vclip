@@ -99,6 +99,9 @@ const port = Number(process.env.PORT || 4173);
 const rootDir = resolve(process.cwd(), 'dist');
 const logDir = resolve(process.cwd(), 'logs');
 const accessPassword = process.env.ACCESS_PASSWORD || '';
+const secretPath = (process.env.SECRET_PATH || process.env.VITE_SECRET_PATH || '')
+  .replace(/^\/+|\/+$/g, '')
+  .toLowerCase();
 
 mkdirSync(logDir, { recursive: true });
 
@@ -140,6 +143,41 @@ function getLocalDateStamp(date = new Date()) {
 function isPageRequest(urlPath) {
   if (urlPath.startsWith('/assets/')) return false;
   return extname(urlPath) === '';
+}
+
+const NOT_FOUND_HTML = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>404</title>
+<style>
+  html, body { height: 100%; margin: 0; }
+  body {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #030303;
+    color: #52525b;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    letter-spacing: -0.05em;
+  }
+</style>
+</head>
+<body>404 // NOT_FOUND</body>
+</html>`;
+
+function sendNotFoundPage(res) {
+  res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' });
+  res.end(NOT_FOUND_HTML);
+}
+
+function matchesSecretPath(urlPath) {
+  if (!secretPath) return true;
+  if (!isPageRequest(urlPath)) return true;
+
+  const firstSegment = urlPath.replace(/^\/+/, '').split('/')[0].toLowerCase();
+  return firstSegment === secretPath;
 }
 
 function logAccess(req, urlPath, statusCode) {
@@ -305,6 +343,12 @@ const server = createServer((req, res) => {
     return;
   }
 
+  if (!matchesSecretPath(urlPath)) {
+    console.log(`[Security] Blocked ${urlPath} (secret path mismatch)`);
+    sendNotFoundPage(res);
+    return;
+  }
+
   if (!existsSync(rootDir)) {
     res.writeHead(503, { 'Content-Type': 'text/plain; charset=utf-8' });
     res.end('dist not found. Run npm run build first.');
@@ -354,6 +398,11 @@ server.listen(port, () => {
   console.log(`Vclip server running on http://localhost:${port}`);
   console.log(`SQLite database: ${dbPath}`);
   console.log(`Access logs: ${join(logDir, 'access-YYYY-MM-DD.log')}`);
+  if (secretPath) {
+    console.log(`Secret entry: http://localhost:${port}/${secretPath}`);
+  } else {
+    console.warn('[Warn] SECRET_PATH is empty, every page path is reachable.');
+  }
 });
 
 function shutdown(signal) {
