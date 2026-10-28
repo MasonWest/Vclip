@@ -69,6 +69,11 @@ const statements = {
     VALUES (?)
     RETURNING id, content, type, created_at, expires_at
   `),
+  insertWithExpiry: db.prepare(`
+    INSERT INTO clips (content, expires_at)
+    VALUES (?, ?)
+    RETURNING id, content, type, created_at, expires_at
+  `),
   remove: db.prepare('DELETE FROM clips WHERE id = ?'),
   purge: db.prepare(`
     DELETE FROM clips
@@ -77,7 +82,22 @@ const statements = {
 };
 
 const MAX_CONTENT_LENGTH = 1024 * 1024;
+const MAX_EXPIRES_DAYS = 30;
 const PURGE_INTERVAL_MS = 10 * 60 * 1000;
+
+function normalizeExpiresAt(value) {
+  if (typeof value !== 'string' || !value.trim()) return null;
+
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return null;
+
+  const now = Date.now();
+  const timestamp = parsed.getTime();
+  if (timestamp <= now) return null;
+  if (timestamp > now + MAX_EXPIRES_DAYS * 24 * 60 * 60 * 1000) return null;
+
+  return parsed.toISOString();
+}
 
 function purgeExpiredClips(reason) {
   try {
@@ -290,8 +310,12 @@ async function handleClipsApi(req, res, urlPath) {
         return;
       }
 
+      const expiresAt = normalizeExpiresAt(body.expires_at);
+
       try {
-        const row = statements.insert.get(trimmed);
+        const row = expiresAt
+          ? statements.insertWithExpiry.get(trimmed, expiresAt)
+          : statements.insert.get(trimmed);
         console.log(`[API] POST /api/clips - Successfully inserted clip ID: ${row.id}`);
         sendJSON(res, 201, row);
       } catch (postError) {
