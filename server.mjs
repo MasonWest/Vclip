@@ -1,6 +1,8 @@
 import { createServer } from 'node:http';
+import { createHmac, timingSafeEqual } from 'node:crypto';
 import { createReadStream, existsSync, statSync, mkdirSync, appendFileSync, readFileSync } from 'node:fs';
 import { extname, join, resolve, normalize, sep } from 'node:path';
+import { networkInterfaces } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 
 function loadEnvFile(filePath) {
@@ -125,6 +127,34 @@ const secretPath = (process.env.SECRET_PATH || process.env.VITE_SECRET_PATH || '
 
 mkdirSync(logDir, { recursive: true });
 
+// ---------------------------------------------------------------------------
+// 会话（Cookie）认证
+//
+// 目标：密码可以设得很复杂，但同设备只需输入一次。
+// - 会话 Cookie 的值由 HMAC(密码 + 入口路径) 派生，不含明文密码
+// - 改密码后派生值随之变化，所有旧 Cookie 立即失效
+// - 一次性登录链接（?k=）用于手机首次登录，省去在手机上敲密码
+// ---------------------------------------------------------------------------
+const SESSION_COOKIE = 'vclip_session';
+const SESSION_MAX_AGE_SECONDS = 365 * 24 * 60 * 60;
+
+function deriveKey(purpose) {
+  if (!accessPassword) return '';
+  return createHmac('sha256', `${accessPassword}|${secretPath}`)
+    .update(purpose)
+    .digest('base64url');
+}
+
+const sessionValue = deriveKey('session-v1');
+const loginKey = deriveKey('login-v1');
+
+function safeEqual(a, b) {
+  const left = Buffer.from(String(a ?? ''));
+  const right = Buffer.from(String(b ?? ''));
+  if (left.length === 0 || left.length !== right.length) return false;
+  return timingSafeEqual(left, right);
+}
+
 const mimeTypes = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'application/javascript; charset=utf-8',
@@ -228,20 +258,211 @@ function parseBasicAuth(headerValue) {
   }
 }
 
-function requireAccessPassword(req, res) {
+function parseCookies(req) {
+  const header = req.headers.cookie;
+  if (!header) return {};
+
+  const cookies = {};
+  for (const part of header.split(';')) {
+    const separatorIndex = part.indexOf('=');
+    if (separatorIndex === -1) continue;
+
+    const key = part.slice(0, separatorIndex).trim();
+    if (!key) continue;
+
+    try {
+      cookies[key] = decodeURIComponent(part.slice(separatorIndex + 1).trim());
+    } catch {
+      cookies[key] = part.slice(separatorIndex + 1).trim();
+    }
+  }
+  return cookies;
+}
+
+function isSecureRequest(req) {
+  if (req.socket.encrypted) return true;
+  const forwarded = String(req.headers['x-forwarded-proto'] || '');
+  return forwarded.split(',')[0].trim() === 'https';
+}
+
+function buildSessionCookie(req) {
+  const secure = isSecureRequest(req) ? '; Secure' : '';
+  return `${SESSION_COOKIE}=${encodeURIComponent(sessionValue)}; Path=/; `
+    + `Max-Age=${SESSION_MAX_AGE_SECONDS}; HttpOnly; SameSite=Lax${secure}`;
+}
+
+function buildLogoutCookie(req) {
+  const secure = isSecureRequest(req) ? '; Secure' : '';
+  return `${SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax${secure}`;
+}
+
+// 认证通过的条件（任一满足）：
+// 1. Cookie 会话有效 —— 浏览器日常访问走这条，无需重复输密码
+// 2. HTTP Basic Auth 有效 —— 保留给 curl、file-share-server 等程序化调用
+function isAuthenticated(req) {
   if (!accessPassword) return true;
 
   const credentials = parseBasicAuth(req.headers.authorization);
-  if (credentials && credentials.password === accessPassword) {
+  if (credentials && safeEqual(credentials.password, accessPassword)) {
     return true;
   }
 
+  const cookies = parseCookies(req);
+  if (cookies[SESSION_COOKIE] && safeEqual(cookies[SESSION_COOKIE], sessionValue)) {
+    return true;
+  }
+
+  return false;
+}
+
+function sendUnauthorized(res) {
   res.writeHead(401, {
     'Content-Type': 'text/plain; charset=utf-8',
     'WWW-Authenticate': 'Basic realm="Vclip", charset="UTF-8"',
   });
   res.end('Authentication required');
-  return false;
+}
+
+function redirect(res, location, extraHeaders = {}) {
+  res.writeHead(302, { Location: location, ...extraHeaders });
+  res.end();
+}
+
+// 只允许站内相对路径，避免登录后被重定向到外部站点
+function safeRedirectTarget(raw) {
+  if (typeof raw !== 'string' || !raw.startsWith('/') || raw.startsWith('//')) {
+    return '/';
+  }
+  return raw;
+}
+
+function readRawBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', chunk => {
+      body += chunk.toString();
+      if (body.length > 8192) {
+        reject(new Error('Body too large'));
+        req.destroy();
+      }
+    });
+    req.on('end', () => resolve(body));
+    req.on('error', reject);
+  });
+}
+
+function sendLoginPage(res, nextPath, hasError) {
+  const next = escapeHtml(nextPath || '');
+  const errorBlock = hasError
+    ? '<p class="err">密码不正确，请重试</p>'
+    : '';
+  const html = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>Vclip</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    display: flex; align-items: center; justify-content: center;
+    background: #050505; color: #e4e4e7;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    padding: 24px;
+  }
+  .card { width: 100%; max-width: 340px; }
+  h1 { font-size: 15px; font-weight: 500; letter-spacing: .08em;
+       text-transform: uppercase; color: #71717a; margin: 0 0 28px; }
+  input[type=password] {
+    width: 100%; padding: 14px 16px; font-size: 16px;
+    background: #0c0c0e; color: #e4e4e7;
+    border: 1px solid #27272a; border-radius: 10px; outline: none;
+    transition: border-color .15s;
+  }
+  input[type=password]:focus { border-color: #6366f1; }
+  button {
+    width: 100%; margin-top: 12px; padding: 14px; font-size: 15px;
+    background: #6366f1; color: #fff; border: 0; border-radius: 10px;
+    cursor: pointer; transition: background .15s;
+  }
+  button:hover { background: #4f46e5; }
+  .err { color: #f87171; font-size: 13px; margin: 0 0 14px; }
+  .tip { color: #52525b; font-size: 12px; line-height: 1.6; margin-top: 22px; }
+</style>
+</head>
+<body>
+  <form class="card" method="POST" action="/__login">
+    <h1>Vclip</h1>
+    ${errorBlock}
+    <input type="password" name="password" placeholder="访问密码"
+           autocomplete="current-password" autofocus required>
+    <input type="hidden" name="next" value="${next}">
+    <button type="submit">进入</button>
+    <p class="tip">登录后本设备一年内免密。</p>
+  </form>
+</body>
+</html>`;
+
+  res.writeHead(200, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Cache-Control': 'no-store',
+  });
+  res.end(html);
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, ch => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[ch]));
+}
+
+async function handleLoginRoute(req, res, requestUrl) {
+  if (!accessPassword) {
+    redirect(res, '/');
+    return;
+  }
+
+  if (req.method === 'GET') {
+    // 已登录时不必再看登录页
+    if (isAuthenticated(req)) {
+      redirect(res, safeRedirectTarget(requestUrl.searchParams.get('next') || '/'));
+      return;
+    }
+    sendLoginPage(
+      res,
+      requestUrl.searchParams.get('next') || '',
+      requestUrl.searchParams.get('error') === '1',
+    );
+    return;
+  }
+
+  if (req.method !== 'POST') {
+    sendUnauthorized(res);
+    return;
+  }
+
+  let body;
+  try {
+    body = await readRawBody(req);
+  } catch {
+    redirect(res, '/__login?error=1');
+    return;
+  }
+
+  const params = new URLSearchParams(body);
+  const password = params.get('password') || '';
+  const next = safeRedirectTarget(params.get('next') || '/');
+
+  if (!safeEqual(password, accessPassword)) {
+    console.log('[Auth] Login failed (wrong password)');
+    const nextParam = next === '/' ? '' : `&next=${encodeURIComponent(next)}`;
+    redirect(res, `/__login?error=1${nextParam}`);
+    return;
+  }
+
+  console.log('[Auth] Login succeeded, session cookie issued');
+  redirect(res, next, { 'Set-Cookie': buildSessionCookie(req) });
 }
 
 function safeFilePath(urlPath) {
@@ -357,8 +578,42 @@ const server = createServer((req, res) => {
 
   res.on('finish', () => logAccess(req, urlPath, res.statusCode));
 
-  if (!requireAccessPassword(req, res)) {
-    console.log(`[Auth] Request to ${urlPath} failed authentication`);
+  // 登录 / 登出路由必须在鉴权之前处理
+  if (urlPath === '/__login') {
+    handleLoginRoute(req, res, requestUrl).catch(err => {
+      console.error('[Auth] Login handler error:', err);
+      if (!res.headersSent) sendUnauthorized(res);
+    });
+    return;
+  }
+
+  if (urlPath === '/__logout') {
+    redirect(res, '/__login', { 'Set-Cookie': buildLogoutCookie(req) });
+    return;
+  }
+
+  if (!isAuthenticated(req)) {
+    // 一次性登录链接：手机首次访问时带上 ?k=xxx，免去在小屏上敲密码
+    const loginParam = requestUrl.searchParams.get('k');
+    if (loginParam && loginKey && safeEqual(loginParam, loginKey)) {
+      const cleanUrl = new URL(requestUrl);
+      cleanUrl.searchParams.delete('k');
+      console.log('[Auth] Login link accepted, session cookie issued');
+      redirect(res, urlPath + cleanUrl.search, { 'Set-Cookie': buildSessionCookie(req) });
+      return;
+    }
+
+    console.log(`[Auth] Unauthenticated request to ${urlPath}`);
+
+    // API 保持 401 + WWW-Authenticate，兼容 curl 与 file-share-server 的程序化调用
+    if (urlPath === '/api/clips' || urlPath.startsWith('/api/clips/') || !isPageRequest(urlPath)) {
+      sendUnauthorized(res);
+      return;
+    }
+
+    // 页面请求改为跳转登录页，不再弹浏览器的原生 Basic Auth 框
+    const nextParam = urlPath === '/' ? '' : `?next=${encodeURIComponent(urlPath)}`;
+    redirect(res, `/__login${nextParam}`);
     return;
   }
 
@@ -418,14 +673,43 @@ const server = createServer((req, res) => {
   stream.pipe(res);
 });
 
+function getLanAddresses() {
+  const addresses = [];
+  for (const entries of Object.values(networkInterfaces())) {
+    for (const entry of entries || []) {
+      if (entry.family === 'IPv4' && !entry.internal) {
+        addresses.push(entry.address);
+      }
+    }
+  }
+  return addresses;
+}
+
 server.listen(port, () => {
   console.log(`Vclip server running on http://localhost:${port}`);
   console.log(`SQLite database: ${dbPath}`);
   console.log(`Access logs: ${join(logDir, 'access-YYYY-MM-DD.log')}`);
-  if (secretPath) {
-    console.log(`Secret entry: http://localhost:${port}/${secretPath}`);
-  } else {
+
+  if (!secretPath) {
     console.warn('[Warn] SECRET_PATH is empty, every page path is reachable.');
+  } else {
+    console.log(`Entry: http://localhost:${port}/${secretPath}`);
+    for (const address of getLanAddresses()) {
+      console.log(`   LAN: http://${address}:${port}/${secretPath}`);
+    }
+  }
+
+  if (accessPassword) {
+    const suffixes = [`localhost:${port}`, ...getLanAddresses().map(a => `${a}:${port}`)];
+    console.log('');
+    console.log('免密登录链接（手机首次访问用，之后一年内免密）:');
+    for (const suffix of suffixes) {
+      const path = secretPath ? `/${secretPath}` : '/';
+      console.log(`   http://${suffix}${path}?k=${loginKey}`);
+    }
+    console.log('修改 ACCESS_PASSWORD 会让所有已登录设备立即失效。');
+  } else {
+    console.warn('[Warn] ACCESS_PASSWORD is empty, authentication is DISABLED.');
   }
 });
 
