@@ -630,8 +630,15 @@ const server = createServer((req, res) => {
   }
 
   const lanTrusted = isLanTrusted(req);
+  const onSecretPath = matchesSecretPath(urlPath);
+  const isApiPath = urlPath === '/api/clips' || urlPath.startsWith('/api/clips/');
 
-  if (!lanTrusted && !isAuthenticated(req)) {
+  // 局域网免密只在「入口路径 + 接口 + 静态资源」上生效，普通页面（尤其 /）仍然要密码。
+  // 这样开启免密后，站点对外仍表现为「一个需要密码的站」，
+  // 入口路径不会被顺手暴露出去，攻击者也无从猜到还有隐藏路径。
+  const lanBypass = lanTrusted && (onSecretPath || isApiPath);
+
+  if (!lanBypass && !isAuthenticated(req)) {
     // 一次性登录链接：手机首次访问时带上 ?k=xxx，免去在小屏上敲密码
     const loginParam = requestUrl.searchParams.get('k');
     if (loginParam && loginKey && safeEqual(loginParam, loginKey)) {
@@ -661,7 +668,9 @@ const server = createServer((req, res) => {
     return;
   }
 
-  if (!lanTrusted && !matchesSecretPath(urlPath)) {
+  // 入口路径校验对任何来源都生效（含局域网免密设备）：
+  // 免密只是免掉密码，不是免掉入口路径，/ 依然返回 404。
+  if (!onSecretPath) {
     console.log(`[Security] Blocked ${urlPath} (secret path mismatch)`);
     sendNotFoundPage(res);
     return;
@@ -740,11 +749,19 @@ server.listen(port, () => {
 
   if (lanFreeAccess) {
     console.log('');
-    console.log('局域网免密已开启 —— 同网段设备直接访问，无需密码和入口路径:');
-    for (const address of getLanAddresses()) {
-      console.log(`   http://${address}:${port}/`);
+    if (secretPath) {
+      console.log('局域网免密已开启 —— 同网段设备访问入口路径直接进入，无需密码:');
+      for (const address of getLanAddresses()) {
+        console.log(`   http://${address}:${port}/${secretPath}`);
+      }
+      console.log('首页 / 及其他路径仍然要求密码，站点对外仍是「需要密码」的形态。');
+    } else {
+      console.log('局域网免密已开启 —— 未设置 SECRET_PATH，同网段设备可访问全部页面:');
+      for (const address of getLanAddresses()) {
+        console.log(`   http://${address}:${port}/`);
+      }
     }
-    console.log('VR 头显把这个地址存成书签即可，零输入进入。');
+    console.log('VR 头显把上面的入口路径存成书签即可，零输入进入。');
     console.log('非局域网来源（公网）仍需密码 + 入口路径。');
   }
 
