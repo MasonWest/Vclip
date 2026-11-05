@@ -16,7 +16,7 @@
 - 入口路径 `SECRET_PATH` 仅服务端校验；**不匹配时对任何来源都返回真 404**（含已登录、含局域网）
 - `LAN_FREE_ACCESS=true`：**免密码但不免入口路径**
   `lanBypass = lanTrusted && (onSecretPath || isApiPath) || isPublicAsset`
-- `isLanTrusted()` 只信 `socket.remoteAddress`，**故意不读 X-Forwarded-For**（可伪造）
+- `isLanTrusted()` 用 `getClientIp()`：直连只信 socket 对端地址（转发头一概不读，可伪造）；**仅当对端是本机**（`localAddresses` = 回环 + 本机网卡）才采信 `CF-Connecting-IP` / `XFF` 首段。否则 cloudflared 隧道（从 127.0.0.1 连入）会把公网访客全变成"局域网"，整条隧道成免密后门
 - 图标等 `isPublicAsset` 免鉴权，否则 iOS 加主屏拿不到图
 
 ## 图片上传

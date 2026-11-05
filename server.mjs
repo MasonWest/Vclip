@@ -279,14 +279,38 @@ const mimeTypes = {
   '.woff2': 'font/woff2',
 };
 
-function getClientIp(req) {
-  const forwarded = req.headers['x-forwarded-for'];
-  if (typeof forwarded === 'string' && forwarded.trim()) {
-    return forwarded.split(',')[0].trim();
+// 本机地址集合：回环 + 本机各网卡地址。
+// 只有「对端地址属于本机」的请求，才可能是同机运行的反向代理（cloudflared
+// 隧道默认就是 127.0.0.1 → 4173），这类请求的代理头才有采信的价值。
+const localAddresses = new Set(['127.0.0.1', '::1']);
+for (const entries of Object.values(networkInterfaces())) {
+  for (const entry of entries || []) {
+    if (entry?.address) localAddresses.add(entry.address.replace(/^::ffff:/, ''));
   }
+}
 
-  const remoteAddress = req.socket.remoteAddress || '';
-  return remoteAddress.replace(/^::ffff:/, '') || 'unknown';
+function stripIpPrefix(ip) {
+  return String(ip || '').trim().replace(/^::ffff:/, '');
+}
+
+// 取「可信的客户端地址」：
+// - 普通直连（含局域网设备）：一律用 socket 对端地址，转发头一概不采信 —— 头部
+//   任何客户端都能伪造，采信它等于让公网访客自称内网。
+// - 对端是本机时（反向代理 / 隧道）：采信代理写入的真实客户端地址，否则代理会把
+//   所有公网访客都变成 127.0.0.1，从而错误命中局域网免密。
+//   优先 CF-Connecting-IP（Cloudflare 隧道必定写入且不可由外部覆盖），其次 XFF。
+function getClientIp(req) {
+  const socketIp = stripIpPrefix(req.socket.remoteAddress);
+  if (!localAddresses.has(socketIp)) return socketIp || 'unknown';
+
+  const cfIp = stripIpPrefix(req.headers['cf-connecting-ip']);
+  if (cfIp) return cfIp;
+
+  const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0];
+  const forwardedIp = stripIpPrefix(forwarded);
+  if (forwardedIp) return forwardedIp;
+
+  return socketIp;
 }
 
 // ---------------------------------------------------------------------------
@@ -295,15 +319,12 @@ function getClientIp(req) {
 // VR 头显、手机这类设备打字成本极高。开启后，来自局域网私有地址的请求
 // 直接放行，不需要密码也不需要入口路径，头显里存一个 http://IP:端口 书签即用。
 //
-// 刻意只采信 socket 地址，不读 X-Forwarded-For：该请求头可被客户端伪造，
-// 若采信它，任何能连上端口的人加个头就能冒充局域网。
+// 判定依据是「可信的客户端地址」（见 getClientIp）：直连时即 socket 对端地址，
+// 不接受任何转发头（可被客户端伪造）；仅当对端是本机（同机反向代理 / 隧道）时，
+// 才采用代理写入的真实客户端地址 —— 否则 cloudflared 会把全部公网访客都变成
+// 127.0.0.1，隧道反而成了免密后门。
 // ---------------------------------------------------------------------------
 const lanFreeAccess = (process.env.LAN_FREE_ACCESS || '').toLowerCase() === 'true';
-
-function getSocketIp(req) {
-  const remoteAddress = req.socket.remoteAddress || '';
-  return remoteAddress.replace(/^::ffff:/, '');
-}
 
 function isPrivateAddress(ip) {
   if (!ip) return false;
@@ -323,7 +344,7 @@ function isPrivateAddress(ip) {
 
 function isLanTrusted(req) {
   if (!lanFreeAccess) return false;
-  return isPrivateAddress(getSocketIp(req));
+  return isPrivateAddress(getClientIp(req));
 }
 
 function getLocalDateStamp(date = new Date()) {
