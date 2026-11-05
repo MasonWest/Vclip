@@ -1,8 +1,8 @@
 ﻿# Vclip
 
-跨设备的极简文本剪贴板。手机、电脑、VR 浏览器之间传递文字和链接，不需要登录、不需要装客户端。
+跨设备的极简剪贴板。手机、电脑、VR 浏览器之间传递文字、链接和截图，不需要登录、不需要装客户端。
 
-场景：在 VR 头显里想打开一个别人发来的链接，你没法打字。手机发一条到 Vclip，头显浏览器打开入口，点一下复制，结束。
+场景：在 VR 头显里想打开一个别人发来的链接，你没法打字。手机发一条到 Vclip，头显浏览器打开入口，点一下复制，结束。截图同理——电脑上 `Win+Shift+S` 截完直接 `Ctrl+V`，手机上打开就是图。
 
 ## 技术架构
 
@@ -10,7 +10,7 @@
 |---|---|
 | 前端 | React 19 + TypeScript + Vite 6，Tailwind + Framer Motion，打包为静态文件 |
 | 服务端 | `server.mjs`，Node 原生 `node:http`，**无 Web 框架、无第三方运行时依赖** |
-| 存储 | SQLite，通过 Node 22 内置的 `node:sqlite`（`DatabaseSync`），单文件落盘 |
+| 存储 | SQLite（`node:sqlite` 的 `DatabaseSync`）存记录，图片字节落 `data/uploads/` |
 | 鉴权 | 密码登录 + 一年期 Cookie 会话（Basic Auth 保留给程序化调用） |
 
 服务端只 import 四个内置模块：`node:http`、`node:fs`、`node:path`、`node:sqlite`。`package.json` 里的运行时依赖全部属于前端。
@@ -71,7 +71,8 @@ npm run serve
 |---|---|---|
 | `GET` | `/api/clips` | 返回最近 100 条未过期记录，按 `id` 倒序 |
 | `POST` | `/api/clips` | 新建一条，返回完整行（含数据库生成的 `id` 和时间戳） |
-| `DELETE` | `/api/clips/:id` | 删除指定记录 |
+| `DELETE` | `/api/clips/:id` | 删除指定记录（若是图片，同时删除磁盘文件） |
+| `GET` | `/api/media/:filename` | 读取图片字节，`filename` 来自图片记录的 `content` |
 
 ### POST /api/clips
 
@@ -117,6 +118,42 @@ curl -u "vclip:你的密码" -X DELETE http://127.0.0.1:4173/api/clips/1
 ```
 
 `POST` 之所以返回整行，是因为前端采用乐观 UI：插入时先渲染临时行，拿到真实 `id` 和时间戳后再替换。
+
+### 上传图片
+
+同一个 `POST /api/clips`，把 `Content-Type` 换成 `image/*`，请求体直接是图片字节（**不是** `multipart/form-data`）：
+
+```bash
+curl -u "vclip:你的密码" -X POST http://127.0.0.1:4173/api/clips \
+  -H 'Content-Type: image/png' \
+  --data-binary @screenshot.png
+```
+
+返回 `201`：
+
+```json
+{
+  "id": 12,
+  "content": "mw2bapik-95ed1a16-567f-4b4c-94ea-d462ce4a5cc4.png",
+  "type": "image",
+  "created_at": "2026-11-04T16:09:12.622Z",
+  "expires_at": "2026-11-05T16:09:12.622Z"
+}
+```
+
+图片的 `content` 存的是文件名，不是图片本身。字节落在 `data/uploads/`，列表接口因此不会被 base64 撑爆。
+
+| 约束 | 值 |
+|---|---|
+| 允许格式 | PNG / JPEG / GIF / WebP |
+| 类型判定 | 读文件头魔数，**不信任** `Content-Type` 和扩展名 |
+| SVG | **一律拒绝（415）**，原因见下方安全模型 |
+| 单张上限 | 8MB（`Content-Length` 超限直接 413，不读请求体） |
+| 读取地址 | `GET /api/media/:filename`，带 `Cache-Control: private, immutable` |
+| 生命周期 | 与文本一致，默认 24 小时；过期清理时连文件一起删 |
+
+前端在浏览器里会先把长边压到 2400 的 JPEG（小于 900KB 的原图直传），所以手机直出的 5MB 照片通常只上传几百 KB。
+
 
 ## 认证与会话
 
@@ -200,8 +237,9 @@ DHCP 会换 IP，书签就失效。两个办法：
 
 1. **会话认证**：Cookie 或 Basic Auth 任一有效即放行，否则页面跳登录页、API 返回 `401`。若开启了 `LAN_FREE_ACCESS`，私有网段来源访问入口路径时会跳过本层（仅限入口路径，`/` 依旧要密码）。
 2. **入口路径校验**：路径首段必须等于 `SECRET_PATH`，否则返回真正的 HTTP `404` 和独立错误页，**不会返回 `index.html`**。这段逻辑只在 `server.mjs`，前端 bundle 中没有入口字符串，查看源码拿不到。
-3. **路径穿越防护**：静态文件解析后必须落在 `dist/` 内，否则 `403`。
+3. **路径穿越防护**：静态文件解析后必须落在 `dist/` 内，否则 `403`；图片文件名只接受 `[A-Za-z0-9._-]` 且扩展名在白名单内。
 4. **重定向校验**：登录后的 `next` 参数只接受站内相对路径，`//evil.com` 这类协议相对地址会被丢弃，避免开放重定向。
+5. **上传内容校验**：图片类型按文件头魔数判定，**不接受 SVG**——SVG 可以内嵌 `<script>`，被 `<img src>` 同源加载时等于在自己的域里执行任意脚本，能直接读走 Cookie 和入口路径。响应统一带 `X-Content-Type-Options: nosniff`。
 
 已知边界：
 
@@ -213,11 +251,15 @@ DHCP 会换 IP，书签就失效。两个办法：
 
 ## 数据与备份
 
-全部数据在 `data/vclip.db` 一个文件里。
+数据分两处：
+
+- `data/vclip.db` —— 所有文本和图片记录（图片只存文件名）
+- `data/uploads/` —— 图片字节
 
 ```bash
-# 停止服务后直接复制即可
+# 停止服务后两处一起复制
 cp data/vclip.db backup.db
+cp -r data/uploads backup-uploads
 ```
 
 WAL 模式下还会有 `vclip.db-wal` 和 `vclip.db-shm` 两个附属文件。推荐在线备份（不用停机）：
@@ -226,7 +268,9 @@ WAL 模式下还会有 `vclip.db-wal` 和 `vclip.db-shm` 两个附属文件。�
 sqlite3 data/vclip.db ".backup backup.db"
 ```
 
-首次启动自动建表，无需手工执行 DDL。过期清理在启动时执行一次，之后每 10 分钟一次，走 `idx_clips_expires_at` 索引。
+首次启动自动建表，无需手工执行 DDL。过期清理在启动时执行一次，之后每 10 分钟一次，走 `idx_clips_expires_at` 索引，**图片过期时磁盘文件同步删除**。启动时还会扫一遍 `data/uploads/`，把数据库里没有引用的孤儿文件清掉。
+
+如果只备份了 `.db` 而漏掉 `uploads/`，恢复后图片记录还在但图片全部打不开——前端会显示「图片加载失败」而不是一块空白。
 
 ## 访问日志
 
@@ -262,17 +306,20 @@ npm run dev
 
 ```
 Vclip/
-├── server.mjs              # 全部服务端逻辑：静态托管、API、登录/会话、日志、SQLite
+├── server.mjs              # 全部服务端逻辑：静态托管、API、登录/会话、日志、SQLite、图片落盘
 ├── src/
-│   ├── App.tsx             # 单页 UI 与数据逻辑
+│   ├── App.tsx             # 单页 UI 与数据逻辑（含拖拽/粘贴上传、压缩、大图预览）
 │   ├── main.tsx
 │   ├── index.css
 │   └── Tailwind.ts
 ├── index.html
+├── public/                 # 图标（构建时原样复制到 dist/）
 ├── vite.config.ts
 ├── 启动vclip.bat            # Windows 一键启动
 ├── .env.example
-└── data/vclip.db           # 运行时生成，已 gitignore
+└── data/
+    ├── vclip.db            # 运行时生成，已 gitignore
+    └── uploads/            # 图片字节，已 gitignore
 ```
 
 ## 设计取舍
@@ -281,10 +328,12 @@ Vclip/
 - **不用 `better-sqlite3`**：它需要原生模块编译，换 Node 大版本就要重装。`node:sqlite` 零依赖，代价是启动时需 `--disable-warning=ExperimentalWarning` 消掉实验性提示。
 - **入口校验放服务端**：前端校验形同注释，看源码即得。宁可多一次 404 分支，也不要假的防护。
 - **时间存 ISO 8601 UTC 文本**：SQLite 没有原生日期类型，这种格式的字典序比较恰好等价于时间比较，`WHERE expires_at > ?` 可以走索引。
+- **图片落盘而不是存 base64**：base64 会让体积涨三分之一，且 `GET /api/clips` 每次都要把全部图片塞进 JSON，十张图就是几 MB，手机端直接卡死。落盘之后列表接口只返回文件名，图片还能被浏览器独立缓存。
+- **上传不走 multipart**：Node 没有内置 multipart 解析器，手写 boundary 解析要几十行且容易出错。直接收原始二进制，`Content-Type` 声明类型，服务端用魔数复核——代码更短，校验也更硬。
 
 ## 已知限制
 
 - `node:sqlite` 在 Node 22 仍标记为 experimental，API 未来可能微调。**升级 Node 大版本前请先跑一次 `npm run serve` 验证**。若真要换回 `better-sqlite3`，只需改 `import` 和三处 `statements` 调用，接口契约不变。
 - 单进程单写入者。适合个人使用场景，不适合多实例部署共享同一个 `.db`。
 - **登录页没有失败次数限速**。安全性完全依赖密码强度，请务必使用长随机密码；若你坚持用短密码，建议在反向代理层加限流。
-- 内容以纯文本存储，暂不支持图片/文件。
+- 支持文本与图片（PNG/JPEG/GIF/WebP），暂不支持任意文件上传。图片按最长边 2400 压缩，超过 8MB 的原始文件会被拒绝。

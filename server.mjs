@@ -1,7 +1,17 @@
 import { createServer } from 'node:http';
-import { createHmac, timingSafeEqual } from 'node:crypto';
-import { createReadStream, existsSync, statSync, mkdirSync, appendFileSync, readFileSync } from 'node:fs';
-import { extname, join, resolve, normalize, sep } from 'node:path';
+import { createHmac, timingSafeEqual, randomUUID } from 'node:crypto';
+import {
+  createReadStream,
+  existsSync,
+  statSync,
+  mkdirSync,
+  appendFileSync,
+  readFileSync,
+  writeFileSync,
+  unlinkSync,
+  readdirSync,
+} from 'node:fs';
+import { basename, extname, join, resolve, normalize, sep } from 'node:path';
 import { networkInterfaces } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 
@@ -35,6 +45,11 @@ loadEnvFile(resolve(process.cwd(), '.env'));
 
 const dataDir = resolve(process.cwd(), 'data');
 mkdirSync(dataDir, { recursive: true });
+
+// 图片文件目录：数据库只存文件名，字节落在磁盘上。
+// 这样列表接口不会被 base64 撑爆，图片也能被浏览器独立缓存。
+const uploadsDir = join(dataDir, 'uploads');
+mkdirSync(uploadsDir, { recursive: true });
 
 const dbPath = process.env.DB_PATH
   ? resolve(process.cwd(), process.env.DB_PATH)
@@ -76,6 +91,17 @@ const statements = {
     VALUES (?, ?)
     RETURNING id, content, type, created_at, expires_at
   `),
+  // 图片：content 存的是 data/uploads 下的文件名，不是图片本身
+  insertImage: db.prepare(`
+    INSERT INTO clips (content, type, expires_at)
+    VALUES (?, 'image', COALESCE(?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+1 day')))
+    RETURNING id, content, type, created_at, expires_at
+  `),
+  getById: db.prepare('SELECT id, content, type FROM clips WHERE id = ?'),
+  expiredImages: db.prepare(`
+    SELECT content FROM clips
+    WHERE type = 'image' AND expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+  `),
   remove: db.prepare('DELETE FROM clips WHERE id = ?'),
   purge: db.prepare(`
     DELETE FROM clips
@@ -84,8 +110,51 @@ const statements = {
 };
 
 const MAX_CONTENT_LENGTH = 1024 * 1024;
+// 单张图片上限。手机原图常见 3-6MB，8MB 足够容下未压缩的直出照片。
+const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 const MAX_EXPIRES_DAYS = 30;
 const PURGE_INTERVAL_MS = 10 * 60 * 1000;
+
+// 只认这四种位图。SVG 永远不收——它可以内嵌 <script>，
+// 一旦被 <img src> 同源加载就等于在自己的域里执行任意脚本。
+const IMAGE_TYPES = {
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  gif: 'image/gif',
+  webp: 'image/webp',
+};
+
+/** 按文件头判断真实类型，不信任 Content-Type 与扩展名 */
+function detectImageType(buf) {
+  if (!buf || buf.length < 12) return null;
+
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'png';
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'jpg';
+
+  const head6 = buf.toString('ascii', 0, 6);
+  if (head6 === 'GIF87a' || head6 === 'GIF89a') return 'gif';
+
+  if (buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') return 'webp';
+
+  return null;
+}
+
+/** 删除上传文件；只接受纯文件名，防止路径穿越 */
+function removeUploadedFile(filename) {
+  if (typeof filename !== 'string' || !filename) return;
+
+  const name = basename(filename);
+  if (name !== filename) return;
+
+  const target = join(uploadsDir, name);
+  if (!target.startsWith(uploadsDir)) return;
+
+  try {
+    if (existsSync(target)) unlinkSync(target);
+  } catch (err) {
+    console.error(`[Cleanup] Failed to remove upload ${name}:`, err.message);
+  }
+}
 
 function normalizeExpiresAt(value) {
   if (typeof value !== 'string' || !value.trim()) return null;
@@ -103,9 +172,16 @@ function normalizeExpiresAt(value) {
 
 function purgeExpiredClips(reason) {
   try {
+    // 先摘出过期图片的文件名：删行之后就拿不到 content 了，
+    // 不先删字节的话 data/uploads 会只进不出。
+    const expiredImages = statements.expiredImages.all();
+    for (const row of expiredImages) removeUploadedFile(row.content);
+
     const info = statements.purge.run();
-    if (info.changes > 0) {
-      console.log(`[Cleanup] Removed ${info.changes} expired clip(s) [${reason}]`);
+    if (info.changes > 0 || expiredImages.length > 0) {
+      console.log(
+        `[Cleanup] Removed ${info.changes} expired clip(s), ${expiredImages.length} image file(s) [${reason}]`
+      );
     }
   } catch (err) {
     console.error('[Cleanup] Failed to purge expired clips:', err);
@@ -113,6 +189,34 @@ function purgeExpiredClips(reason) {
 }
 
 purgeExpiredClips('startup');
+
+/**
+ * 清理 uploads 里没有任何记录引用的文件。
+ * 只会出现在数据库被手工清空/回滚之后；跑一次就够了，不必进定时任务。
+ */
+function pruneOrphanUploads() {
+  try {
+    const referenced = new Set(
+      db.prepare("SELECT content FROM clips WHERE type = 'image'").all().map(row => row.content)
+    );
+
+    let removed = 0;
+    for (const name of readdirSync(uploadsDir)) {
+      if (!referenced.has(name)) {
+        removeUploadedFile(name);
+        removed += 1;
+      }
+    }
+
+    if (removed > 0) {
+      console.log(`[Cleanup] Removed ${removed} orphaned image file(s)`);
+    }
+  } catch (err) {
+    console.error('[Cleanup] Failed to prune orphan uploads:', err.message);
+  }
+}
+
+pruneOrphanUploads();
 
 const purgeTimer = setInterval(() => purgeExpiredClips('interval'), PURGE_INTERVAL_MS);
 purgeTimer.unref();
@@ -161,11 +265,13 @@ const mimeTypes = {
   '.mjs': 'application/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
   '.json': 'application/json; charset=utf-8',
+  '.webmanifest': 'application/manifest+json; charset=utf-8',
   '.svg': 'image/svg+xml',
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
   '.jpeg': 'image/jpeg',
   '.gif': 'image/gif',
+  '.webp': 'image/webp',
   '.ico': 'image/x-icon',
   '.txt': 'text/plain; charset=utf-8',
   '.map': 'application/json; charset=utf-8',
@@ -538,6 +644,53 @@ function getRequestBody(req) {
   });
 }
 
+/**
+ * 收原始二进制（不是 multipart）。
+ * 超限后不再缓存数据但把请求读完：直接 destroy 会掐断连接，
+ * 413 就发不回去了，前端的错误提示会变成「网络错误」。
+ */
+function readBinaryBody(req, maxBytes) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    let overflow = false;
+    let settled = false;
+
+    req.on('data', chunk => {
+      if (settled) return;
+
+      size += chunk.length;
+      if (size > maxBytes) {
+        overflow = true;
+        chunks.length = 0;
+        return;
+      }
+
+      if (!overflow) chunks.push(chunk);
+    });
+
+    req.on('end', () => {
+      if (settled) return;
+      settled = true;
+
+      if (overflow) {
+        const err = new Error('Payload too large');
+        err.code = 'ETOOLARGE';
+        reject(err);
+        return;
+      }
+
+      resolve(Buffer.concat(chunks));
+    });
+
+    req.on('error', err => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    });
+  });
+}
+
 async function handleClipsApi(req, res, urlPath) {
   try {
     const method = req.method;
@@ -554,7 +707,87 @@ async function handleClipsApi(req, res, urlPath) {
       return;
     }
 
+    if (method === 'GET' && urlPath.startsWith('/api/media/')) {
+      const name = urlPath.slice('/api/media/'.length);
+      const ext = name.includes('.') ? name.split('.').pop().toLowerCase() : '';
+      const contentType = IMAGE_TYPES[ext] || '';
+
+      // 文件名必须是上传时生成的形态（字母数字 + . - _），且扩展名在白名单内。
+      // 这一层同时挡掉了 ../ 之类的路径穿越。
+      if (!contentType || !/^[A-Za-z0-9._-]+$/.test(name)) {
+        sendJSON(res, 404, { error: 'Not found' });
+        return;
+      }
+
+      const filePath = join(uploadsDir, name);
+      if (!existsSync(filePath)) {
+        sendJSON(res, 404, { error: 'Not found' });
+        return;
+      }
+
+      const fileStat = statSync(filePath);
+      res.writeHead(200, {
+        'Content-Type': contentType,
+        'Content-Length': fileStat.size,
+        // 文件名带随机 UUID，内容永不变化，可以放心长缓存
+        'Cache-Control': 'private, max-age=31536000, immutable',
+        'X-Content-Type-Options': 'nosniff',
+      });
+      createReadStream(filePath).pipe(res);
+      return;
+    }
+
     if (method === 'POST' && urlPath === '/api/clips') {
+      const requestType = String(req.headers['content-type'] || '').toLowerCase();
+
+      // 图片走原始二进制（不是 multipart）：省掉手写 boundary 解析，
+      // 前端直接把 File/Blob 当 body 发过来。
+      if (requestType.startsWith('image/')) {
+        // Content-Length 超限就直接拒，不必先把几十 MB 读完
+        const declared = Number(req.headers['content-length'] || 0);
+        if (Number.isFinite(declared) && declared > MAX_IMAGE_BYTES) {
+          sendJSON(res, 413, { error: 'Image too large', maxBytes: MAX_IMAGE_BYTES });
+          req.resume();
+          return;
+        }
+
+        let buf;
+        try {
+          buf = await readBinaryBody(req, MAX_IMAGE_BYTES);
+        } catch (err) {
+          if (err.code === 'ETOOLARGE') {
+            sendJSON(res, 413, { error: 'Image too large', maxBytes: MAX_IMAGE_BYTES });
+            return;
+          }
+          throw err;
+        }
+
+        const kind = detectImageType(buf);
+        if (!kind) {
+          sendJSON(res, 415, { error: 'Unsupported image type' });
+          return;
+        }
+
+        const queryExpires = new URL(req.url || '/', 'http://localhost').searchParams.get('expires_at');
+        const expiresAt = normalizeExpiresAt(queryExpires || '');
+
+        const filename = `${Date.now().toString(36)}-${randomUUID()}.${kind}`;
+        writeFileSync(join(uploadsDir, filename), buf);
+
+        try {
+          const row = statements.insertImage.get(filename, expiresAt);
+          console.log(
+            `[API] POST /api/clips - Stored ${kind.toUpperCase()} ${buf.length}B as clip ID ${row.id}`
+          );
+          sendJSON(res, 201, row);
+        } catch (dbError) {
+          // 落库失败就回滚文件，不留孤儿
+          removeUploadedFile(filename);
+          throw dbError;
+        }
+        return;
+      }
+
       const body = await getRequestBody(req);
       const content = body.content;
       if (typeof content !== 'string' || !content.trim()) {
@@ -592,7 +825,10 @@ async function handleClipsApi(req, res, urlPath) {
       }
 
       try {
+        const target = statements.getById.get(id);
         const info = statements.remove.run(id);
+        // 删行之后才删文件：万一 unlink 失败，至少还能从数据库里找回文件名
+        if (target && target.type === 'image') removeUploadedFile(target.content);
         console.log(`[API] DELETE /api/clips/${id} - Removed ${info.changes} row(s)`);
         sendJSON(res, 200, { success: true, deleted: info.changes });
       } catch (deleteError) {
@@ -629,14 +865,47 @@ const server = createServer((req, res) => {
     return;
   }
 
+  // PWA manifest：动态生成，让 start_url 始终指向真实入口路径
+  // （静态文件无法知道 SECRET_PATH，写死会让主屏幕图标打开 / 直接 404）
+  if (urlPath === '/manifest.webmanifest') {
+    const startUrl = secretPath ? `/${secretPath}` : '/';
+    res.writeHead(200, { 'Content-Type': 'application/manifest+json; charset=utf-8' });
+    res.end(JSON.stringify({
+      id: startUrl,
+      name: 'Vclip',
+      short_name: 'Vclip',
+      description: '局域网剪贴板：手机发，VR 里看。',
+      start_url: startUrl,
+      scope: '/',
+      display: 'standalone',
+      orientation: 'any',
+      background_color: '#0B0A14',
+      theme_color: '#0B0A14',
+      icons: [
+        { src: '/icon.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'any' },
+        { src: '/icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
+        { src: '/icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
+        { src: '/icon-maskable-512.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' },
+      ],
+    }));
+    return;
+  }
+
   const lanTrusted = isLanTrusted(req);
   const onSecretPath = matchesSecretPath(urlPath);
-  const isApiPath = urlPath === '/api/clips' || urlPath.startsWith('/api/clips/');
+  // 所有 /api/ 前缀都走同一条鉴权通道。
+  // 这里必须用前缀匹配而不是逐个枚举：漏放行一个前缀（比如 /api/media/），
+  // 局域网免密下的图片加载就会被 401 拦掉，页面出现一排破图。
+  const isApiPath = urlPath.startsWith('/api/');
+
+  // 图标类资源免鉴权：iOS / 浏览器可能在登录前或未带 Cookie 时抓取它们，
+  // 若被 401 拦下，加到主屏幕只会得到一个灰底问号。图标本身不是敏感信息。
+  const isPublicAsset = /^\/(icon\.svg|icon-192\.png|icon-512\.png|icon-maskable-512\.png|apple-touch-icon(-precomposed)?\.png|favicon\.(svg|ico))$/.test(urlPath);
 
   // 局域网免密只在「入口路径 + 接口 + 静态资源」上生效，普通页面（尤其 /）仍然要密码。
   // 这样开启免密后，站点对外仍表现为「一个需要密码的站」，
   // 入口路径不会被顺手暴露出去，攻击者也无从猜到还有隐藏路径。
-  const lanBypass = lanTrusted && (onSecretPath || isApiPath);
+  const lanBypass = (lanTrusted && (onSecretPath || isApiPath)) || isPublicAsset;
 
   if (!lanBypass && !isAuthenticated(req)) {
     // 一次性登录链接：手机首次访问时带上 ?k=xxx，免去在小屏上敲密码
@@ -652,7 +921,7 @@ const server = createServer((req, res) => {
     console.log(`[Auth] Unauthenticated request to ${urlPath}`);
 
     // API 保持 401 + WWW-Authenticate，兼容 curl 与 file-share-server 的程序化调用
-    if (urlPath === '/api/clips' || urlPath.startsWith('/api/clips/') || !isPageRequest(urlPath)) {
+    if (isApiPath || !isPageRequest(urlPath)) {
       sendUnauthorized(res);
       return;
     }
@@ -663,7 +932,7 @@ const server = createServer((req, res) => {
     return;
   }
 
-  if (urlPath === '/api/clips' || urlPath.startsWith('/api/clips/')) {
+  if (isApiPath) {
     handleClipsApi(req, res, urlPath);
     return;
   }
