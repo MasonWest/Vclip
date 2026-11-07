@@ -2,128 +2,32 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Clipboard, Trash2, Check, Search, ImagePlus, Download, X, Loader2 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
-interface Clip {
-  id: number;
-  content: string;
-  created_at: string;
-  expires_at: string;
-  type?: 'text' | 'image';
-  /** 仅前端使用：本地 objectURL 占位，上传完成后被服务端返回的行替换 */
-  pending?: boolean;
-  /**
-   * 仅前端使用：稳定的列表 key。
-   * 上传成功时 id 会从临时负数换成数据库 id，若直接用 id 当 key，
-   * React 会把卡片当成新元素重建，图片闪一下再出来。
-   */
-  uid?: string;
-}
-
-/** 与服务端 MAX_IMAGE_BYTES 保持一致 */
-const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
-/** 超过这个体积才压缩，小图直传保留原始质量 */
-const COMPRESS_THRESHOLD = 900 * 1024;
-/** 压缩后的长边上限 */
-const MAX_EDGE = 2400;
-
-/** 用 <img> 解码：兼容性比 createImageBitmap 好，且浏览器会自动套用照片的 EXIF 方向 */
-function loadImageElement(file: File): Promise<HTMLImageElement> {
-  return new Promise((resolve, reject) => {
-    const url = URL.createObjectURL(file);
-    const img = new Image();
-    img.onload = () => {
-      URL.revokeObjectURL(url);
-      resolve(img);
-    };
-    img.onerror = () => {
-      URL.revokeObjectURL(url);
-      reject(new Error('decode failed'));
-    };
-    img.src = url;
-  });
-}
-
-/**
- * 大图压到长边 2400 的 JPEG。
- * 手机直出照片动辄 4-6MB，压完通常 300-600KB，局域网里几乎瞬时。
- */
-async function shrinkImage(file: File): Promise<Blob> {
-  // GIF 可能带动画，重编码会丢帧，原样上传
-  if (file.type === 'image/gif' || file.size <= COMPRESS_THRESHOLD) {
-    return file;
-  }
-
-  try {
-    const img = await loadImageElement(file);
-    const naturalWidth = img.naturalWidth || img.width;
-    const naturalHeight = img.naturalHeight || img.height;
-    if (!naturalWidth || !naturalHeight) return file;
-
-    const scale = Math.min(1, MAX_EDGE / Math.max(naturalWidth, naturalHeight));
-    const width = Math.max(1, Math.round(naturalWidth * scale));
-    const height = Math.max(1, Math.round(naturalHeight * scale));
-
-    const canvas = document.createElement('canvas');
-    canvas.width = width;
-    canvas.height = height;
-
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return file;
-
-    // 截图的透明区域在 JPEG 里会变成黑块，先铺白底
-    ctx.fillStyle = '#FFFFFF';
-    ctx.fillRect(0, 0, width, height);
-    ctx.imageSmoothingQuality = 'high';
-    ctx.drawImage(img, 0, 0, width, height);
-
-    const blob = await new Promise<Blob | null>(resolve =>
-      canvas.toBlob(resolve, 'image/jpeg', 0.86)
-    );
-
-    // 压完反而更大（原图本身已高度优化）就用原图
-    if (!blob || blob.size >= file.size) return file;
-    return blob;
-  } catch {
-    return file;
-  }
-}
+import type { Clip } from './types';
+import { useClips } from './hooks/useClips';
+import { isImageFile } from './utils/images';
+import { ClipDiscussion } from './components/ClipDiscussion';
 
 export default function CloudClipboard() {
-  const [clips, setClips] = useState<Clip[]>([]);
   const [input, setInput] = useState('');
   const [copiedId, setCopiedId] = useState<number | null>(null);
-  const [uploadingCount, setUploadingCount] = useState(0);
   const [dragging, setDragging] = useState(false);
   const [preview, setPreview] = useState<Clip | null>(null);
+  /** 大图是否已经解码完成，用来决定要不要显示「正在加载原图」 */
+  const [previewLoaded, setPreviewLoaded] = useState(false);
+  const [previewError, setPreviewError] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  const [retentionDays, setRetentionDays] = useState(1);
+  const { clips, uploadingCount, addText, uploadFiles: queueFiles, deleteClip, setStatus } = useClips(setToast);
 
   const copyTimerRef = useRef<number | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  const fetchClips = useCallback(async () => {
-    try {
-      const response = await fetch('/api/clips');
-      if (!response.ok) throw new Error('Fetch failed');
-      const data: Clip[] = await response.json();
-      const rows = data.map(row => ({ ...row, uid: `srv-${row.id}` }));
-      // 正在上传的本地占位要保住，否则一次切页面刷新就把它冲掉了
-      setClips(prev => [...prev.filter(c => c.pending), ...rows]);
-    } catch (error) {
-      console.error('Error fetching clips:', error);
-    }
-  }, []);
-
   useEffect(() => {
-    fetchClips();
-  }, [fetchClips]);
-
-  // 切回这个页面时刷新一次，跨设备同步不用手动刷
-  useEffect(() => {
-    const onVisible = () => {
-      if (document.visibilityState === 'visible') fetchClips();
-    };
-    document.addEventListener('visibilitychange', onVisible);
-    return () => document.removeEventListener('visibilitychange', onVisible);
-  }, [fetchClips]);
+    if (!preview) return;
+    const close = (event: KeyboardEvent) => { if (event.key === 'Escape') setPreview(null); };
+    window.addEventListener('keydown', close);
+    return () => window.removeEventListener('keydown', close);
+  }, [preview]);
 
   useEffect(() => {
     return () => {
@@ -142,92 +46,40 @@ export default function CloudClipboard() {
   const mediaUrl = (clip: Clip) =>
     clip.content.startsWith('blob:') ? clip.content : `/api/media/${clip.content}`;
 
-  const uploadImage = useCallback(
-    async (file: File) => {
-      if (!file.type.startsWith('image/')) {
-        setToast('只能上传图片');
-        return;
-      }
-      if (file.type === 'image/svg+xml') {
-        setToast('不支持 SVG（出于安全考虑）');
-        return;
-      }
-      if (file.size > MAX_UPLOAD_BYTES) {
-        setToast('图片超过 8MB，请先压缩');
-        return;
-      }
+  /**
+   * 列表显示的地址，优先顺序：
+   * 缩略图（几十 KB）→ 本地 blob（刚上传，零延迟）→ 原图（老记录没有缩略图）
+   */
+  const displayUrl = (clip: Clip) => {
+    if (clip.thumb) return `/api/media/${clip.thumb}`;
+    if (clip.localUrl) return clip.localUrl;
+    return mediaUrl(clip);
+  };
 
-      const tempId = -Date.now() - Math.floor(Math.random() * 1000);
-      const localUrl = URL.createObjectURL(file);
-      const uid = `tmp-${tempId}`;
-
-      const placeholder: Clip = {
-        id: tempId,
-        content: localUrl,
-        type: 'image',
-        created_at: new Date().toISOString(),
-        expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
-        pending: true,
-        uid,
-      };
-
-      setClips(prev => [placeholder, ...prev].slice(0, 100));
-      setUploadingCount(n => n + 1);
-
-      try {
-        const blob = await shrinkImage(file);
-
-        const response = await fetch('/api/clips', {
-          method: 'POST',
-          headers: { 'Content-Type': blob.type || 'image/jpeg' },
-          body: blob,
-        });
-
-        if (!response.ok) {
-          const info = await response.json().catch(() => ({}));
-          throw new Error(info.error || `上传失败 (${response.status})`);
-        }
-
-        const saved: Clip = await response.json();
-        setClips(prev => prev.map(c => (c.id === tempId ? { ...saved, uid } : c)));
-      } catch (error) {
-        setClips(prev => prev.filter(c => c.id !== tempId));
-        setToast(error instanceof Error ? error.message : '上传失败');
-      } finally {
-        setUploadingCount(n => Math.max(0, n - 1));
-        // 等 React 把 img 的 src 换成新地址后再释放本地 URL
-        window.setTimeout(() => URL.revokeObjectURL(localUrl), 1500);
-      }
-    },
-    []
-  );
-
-  const uploadFiles = useCallback(
-    (files: FileList | File[]) => {
-      const images = Array.from(files).filter(f => f.type.startsWith('image/'));
-      if (images.length === 0) {
-        setToast('没有可上传的图片');
-        return;
-      }
-      images.forEach(file => uploadImage(file));
-    },
-    [uploadImage]
-  );
+  const uploadFiles = useCallback((files: FileList | File[]) => {
+    const images = Array.from(files).filter(isImageFile);
+    if (!images.length) {
+      setToast('请选择图片；Live Photo 请选静态照片，暂不支持 MOV 视频');
+      return;
+    }
+    if (images.length !== files.length) setToast('已跳过非图片文件，Live Photo 仅保存静态照片');
+    queueFiles(images, retentionDays);
+  }, [queueFiles, retentionDays]);
 
   // 直接 Ctrl+V 粘贴截图
   useEffect(() => {
     const onPaste = (event: ClipboardEvent) => {
       const files = Array.from(event.clipboardData?.files || []);
-      const images = files.filter(f => f.type.startsWith('image/'));
+      const images = files.filter(isImageFile);
       if (images.length === 0) return;
 
       event.preventDefault();
-      images.forEach(file => uploadImage(file));
+      uploadFiles(images);
     };
 
     window.addEventListener('paste', onPaste);
     return () => window.removeEventListener('paste', onPaste);
-  }, [uploadImage]);
+  }, [uploadFiles]);
 
   // 拖拽上传
   useEffect(() => {
@@ -277,56 +129,11 @@ export default function CloudClipboard() {
     };
   }, [uploadFiles]);
 
-  const addClip = async (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key !== 'Enter' || !input.trim()) return;
-
-    const newContent = input.trim();
+  const addClip = async (event: React.KeyboardEvent<HTMLInputElement>) => {
+    if (event.key !== 'Enter' || event.nativeEvent.isComposing || !input.trim()) return;
+    const content = input.trim();
     setInput('');
-
-    const tempId = Date.now();
-    const newClip: Clip = {
-      id: tempId,
-      content: newContent,
-      created_at: new Date().toISOString(),
-      expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
-      type: 'text',
-      uid: `tmp-${tempId}`,
-    };
-
-    setClips(prev => [newClip, ...prev].slice(0, 100));
-
-    try {
-      const response = await fetch('/api/clips', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ content: newContent }),
-      });
-      if (!response.ok) throw new Error('Insert failed');
-      const savedClip = await response.json();
-      setClips(prev =>
-        prev.map(c => (c.id === tempId ? { ...savedClip, uid: `tmp-${tempId}` } : c))
-      );
-    } catch (error) {
-      console.error('Error adding clip:', error);
-      fetchClips();
-    }
-  };
-
-  const deleteClip = async (id: number) => {
-    const snapshot = clips;
-    setClips(prev => prev.filter(c => c.id !== id));
-    // 还在上传的占位卡片 id 是负数，服务端还没有这一行
-    if (id <= 0) return;
-    try {
-      const response = await fetch(`/api/clips/${id}`, {
-        method: 'DELETE',
-      });
-      if (!response.ok) throw new Error('Delete failed');
-    } catch (error) {
-      console.error('Error deleting clip:', error);
-      setClips(snapshot);
-      setToast('删除失败，已恢复');
-    }
+    if (!await addText(content, retentionDays)) setInput(current => current || content);
   };
 
   const fallbackCopyText = (text: string) => {
@@ -388,7 +195,7 @@ export default function CloudClipboard() {
       <input
         ref={fileInputRef}
         type="file"
-        accept="image/png,image/jpeg,image/webp,image/gif"
+        accept="image/*,.heic,.heif,.hif"
         multiple
         className="hidden"
         onChange={e => {
@@ -443,6 +250,12 @@ export default function CloudClipboard() {
             </button>
           </div>
 
+          <div className="max-w-xl mx-auto mt-3 flex items-center justify-between gap-2 text-xs text-zinc-500">
+            <span>新素材保留时间</span>
+            <select aria-label="新素材保留时间" value={retentionDays} onChange={event => setRetentionDays(Number(event.target.value))} className="bg-[#141414] border border-white/10 rounded-lg px-2 py-1 text-zinc-300">
+              <option value={1}>1 天</option><option value={7}>7 天</option><option value={30}>30 天</option>
+            </select>
+          </div>
           <AnimatePresence>
             {uploadingCount > 0 && (
               <motion.p
@@ -513,8 +326,10 @@ export default function CloudClipboard() {
                           )}
                           <button
                             type="button"
-                            onClick={() => deleteClip(clip.id)}
-                            className="p-2 bg-red-500/5 border border-red-500/10 rounded-xl text-zinc-500 hover:text-red-400 hover:bg-red-500/10 transition-all"
+                            aria-label="删除素材"
+                            disabled={clip.pending}
+                            onClick={() => void deleteClip(clip)}
+                            className="p-2 bg-red-500/5 border border-red-500/10 rounded-xl text-zinc-500 hover:text-red-400 hover:bg-red-500/10 transition-all disabled:opacity-30 disabled:cursor-wait"
                           >
                             <Trash2 size={14} />
                           </button>
@@ -524,11 +339,16 @@ export default function CloudClipboard() {
                       {clip.type === 'image' ? (
                         <button
                           type="button"
-                          onClick={() => !clip.pending && setPreview(clip)}
+                          onClick={() => {
+                            if (clip.pending) return;
+                            setPreviewLoaded(false);
+                            setPreviewError(false);
+                            setPreview(clip);
+                          }}
                           className="relative block w-full rounded-xl overflow-hidden cursor-zoom-in"
                         >
                           <img
-                            src={mediaUrl(clip)}
+                            src={displayUrl(clip)}
                             alt=""
                             loading="lazy"
                             className="block mx-auto max-w-full max-h-[420px] w-auto h-auto opacity-0 transition-opacity duration-500"
@@ -554,6 +374,8 @@ export default function CloudClipboard() {
                           {clip.content}
                         </div>
                       )}
+                      <ClipDiscussion clip={clip} onStatus={setStatus} />
+                      <p className="text-[10px] text-zinc-600">保留至 {new Date(clip.expires_at).toLocaleString([], { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</p>
                     </div>
                   </div>
                 </motion.div>
@@ -582,15 +404,35 @@ export default function CloudClipboard() {
             onClick={() => setPreview(null)}
             className="fixed inset-0 z-[100] bg-black/90 backdrop-blur-md flex items-center justify-center p-6 cursor-zoom-out"
           >
-            <motion.img
-              src={mediaUrl(preview)}
-              alt=""
-              initial={{ scale: 0.94, opacity: 0 }}
-              animate={{ scale: 1, opacity: 1 }}
-              exit={{ scale: 0.94, opacity: 0 }}
-              transition={{ type: 'spring', stiffness: 260, damping: 26 }}
-              className="max-w-full max-h-full object-contain rounded-2xl shadow-2xl"
-            />
+            <div className="relative flex items-center justify-center max-w-full max-h-full">
+              {/* 原图几 MB，慢链路上要等很久；先用缩略图放大铺底，
+                  至少让人立刻看到图长什么样，而不是一片黑 */}
+              {preview.thumb && !previewLoaded && (
+                <img
+                  src={`/api/media/${preview.thumb}`}
+                  alt=""
+                  className="absolute max-w-full max-h-full object-contain rounded-2xl blur-2xl scale-105 opacity-50"
+                />
+              )}
+              <motion.img
+                src={mediaUrl(preview)}
+                alt=""
+                onLoad={() => setPreviewLoaded(true)}
+                onError={() => { setPreviewLoaded(true); setPreviewError(true); }}
+                initial={{ scale: 0.94, opacity: 0 }}
+                animate={{ scale: 1, opacity: 1 }}
+                exit={{ scale: 0.94, opacity: 0 }}
+                transition={{ type: 'spring', stiffness: 260, damping: 26 }}
+                className="relative max-w-full max-h-full object-contain rounded-2xl shadow-2xl"
+              />
+              {!previewLoaded && (
+                <div className="absolute flex flex-col items-center gap-2 text-zinc-400 pointer-events-none">
+                  <Loader2 size={22} className="animate-spin" />
+                  <span className="text-[11px] font-light tracking-wide">正在加载原图</span>
+                </div>
+              )}
+              {previewError && <p role="alert" className="absolute text-sm text-zinc-300">原图加载失败，素材可能已过期，请关闭后重试</p>}
+            </div>
             <button
               type="button"
               aria-label="关闭"

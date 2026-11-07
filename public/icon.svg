@@ -19,16 +19,16 @@
     </linearGradient>
 
     <filter id="vc-shadow" x="-30%" y="-30%" width="160%" height="160%">
-      <feDropShadow dx="0" dy="9" stdDeviation="24" flood-color="#000000" flood-opacity="0.55"/>
+      <feDropShadow dx="0" dy="7" stdDeviation="18" flood-color="#000000" flood-opacity="0.5"/>
     </filter>
   </defs>
 
   <rect width="512" height="512" fill="url(#vc-bg)"/>
   <rect width="512" height="512" fill="url(#vc-glow)"/>
 
+  <!-- V 占画幅约 57%（原 69.5%），四周留白 110，iOS squircle 裁切不会切到角尖 -->
   <g filter="url(#vc-shadow)">
-    <!-- 大 V，右上角折走一块，缺口直接露出底色 -->
-    <path d="M78 78 L163 78 L256 300 L349 78 L364 78 L434 148 L299 434 L213 434 Z"
+    <path d="M110 110 L180 110 L256 292 L332 110 L345 110 L402 167 L291 402 L221 402 Z"
           fill="url(#vc-face)"/>
   </g>
 </svg>

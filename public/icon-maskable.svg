@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Vclip">
+  <defs>
+    <linearGradient id="vc-bg" x1="0.15" y1="0" x2="0.85" y2="1">
+      <stop offset="0" stop-color="#0B0A14"/>
+      <stop offset="0.55" stop-color="#0F0D1F"/>
+      <stop offset="1" stop-color="#17142E"/>
+    </linearGradient>
+
+    <radialGradient id="vc-glow" cx="0.5" cy="0.3" r="0.7">
+      <stop offset="0" stop-color="#5A55E0" stop-opacity="0.24"/>
+      <stop offset="0.55" stop-color="#4A44C8" stop-opacity="0.07"/>
+      <stop offset="1" stop-color="#000000" stop-opacity="0"/>
+    </radialGradient>
+
+    <linearGradient id="vc-face" x1="0" y1="0" x2="0.55" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="0.6" stop-color="#F4F2FD"/>
+      <stop offset="1" stop-color="#DBD7EE"/>
+    </linearGradient>
+
+    <filter id="vc-shadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="7" stdDeviation="18" flood-color="#000000" flood-opacity="0.5"/>
+    </filter>
+  </defs>
+
+  <!-- maskable 版：内容收进直径 80% 的圆形安全区（V 上尖距圆心 186 < 204.8），
+       Android 自适应图标任意裁切都不会切掉角 -->
+  <rect width="512" height="512" fill="url(#vc-bg)"/>
+  <rect width="512" height="512" fill="url(#vc-glow)"/>
+
+  <g filter="url(#vc-shadow)">
+    <path d="M123 123 L186 123 L256 289 L326 123 L337 123 L390 175 L288 390 L224 390 Z"
+          fill="url(#vc-face)"/>
+  </g>
+</svg>

@@ -13,13 +13,13 @@
     <meta name="apple-mobile-web-app-title" content="Vclip" />
     <meta name="format-detection" content="telephone=no" />
 
-    <!-- iOS 桌面图标：只认 PNG，SVG 会被忽略 -->
-    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <!-- iOS 主屏幕使用小尺寸 PNG 图标；图标不包含入口或用户数据。 -->
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon-180.png" />
 
-    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
-    <link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg?v=3" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png?v=3" />
     <meta name="theme-color" content="#0B0A14" />
-    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials" />
   </head>
   <body>
     <div id="root"></div>

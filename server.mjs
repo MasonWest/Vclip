@@ -14,6 +14,9 @@ import {
 import { basename, extname, join, resolve, normalize, sep } from 'node:path';
 import { networkInterfaces } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
+import { gzipSync, brotliCompressSync, constants as zlibConstants } from 'node:zlib';
+import { readBinaryBody, readJSONBody } from './server/body.mjs';
+import { createDiscussionStore } from './server/discussion.mjs';
 
 function loadEnvFile(filePath) {
   if (!existsSync(filePath)) return;
@@ -42,6 +45,12 @@ function loadEnvFile(filePath) {
 }
 
 loadEnvFile(resolve(process.cwd(), '.env'));
+
+// 入口和密码始终必填；配置错误时拒绝启动，不能降级为公开访问。
+const accessPassword = process.env.ACCESS_PASSWORD || '';
+const secretPath = (process.env.SECRET_PATH || '').replace(/^\/+|\/+$/g, '').toLowerCase();
+if (!accessPassword.trim()) throw new Error('ACCESS_PASSWORD is required');
+if (!/^[a-z0-9_-]+$/.test(secretPath)) throw new Error('SECRET_PATH must be a non-empty URL segment (letters, numbers, _ or -)');
 
 const dataDir = resolve(process.cwd(), 'data');
 mkdirSync(dataDir, { recursive: true });
@@ -73,9 +82,22 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_clips_expires_at ON clips (expires_at);
 `);
 
+// 缩略图列：老库没有这一列，启动时补上。
+// 允许为 NULL —— 老记录（改造前上传的图）没有缩略图，前端回退到原图。
+{
+  const columns = db.prepare('PRAGMA table_info(clips)').all();
+  if (!columns.some(column => column.name === 'thumb')) {
+    db.exec('ALTER TABLE clips ADD COLUMN thumb TEXT');
+    console.log('[DB] Added clips.thumb column');
+  }
+}
+
+const handleDiscussion = createDiscussionStore(db);
+
 const statements = {
   list: db.prepare(`
-    SELECT id, content, type, created_at, expires_at
+    SELECT id, content, thumb, type, status, created_at, expires_at,
+      (SELECT count(*) FROM comments WHERE clip_id = clips.id) AS comment_count
     FROM clips
     WHERE expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
     ORDER BY id DESC
@@ -84,22 +106,24 @@ const statements = {
   insert: db.prepare(`
     INSERT INTO clips (content)
     VALUES (?)
-    RETURNING id, content, type, created_at, expires_at
+    RETURNING id, content, thumb, type, status, created_at, expires_at
   `),
   insertWithExpiry: db.prepare(`
     INSERT INTO clips (content, expires_at)
     VALUES (?, ?)
-    RETURNING id, content, type, created_at, expires_at
+    RETURNING id, content, thumb, type, status, created_at, expires_at
   `),
-  // 图片：content 存的是 data/uploads 下的文件名，不是图片本身
+  // 图片：content 存的是 data/uploads 下的文件名，不是图片本身；
+  // thumb 是缩略图文件名，列表只加载它，点开大图才取 content 指向的原图
   insertImage: db.prepare(`
     INSERT INTO clips (content, type, expires_at)
     VALUES (?, 'image', COALESCE(?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+1 day')))
-    RETURNING id, content, type, created_at, expires_at
+    RETURNING id, content, thumb, type, status, created_at, expires_at
   `),
-  getById: db.prepare('SELECT id, content, type FROM clips WHERE id = ?'),
+  getById: db.prepare('SELECT id, content, thumb, type FROM clips WHERE id = ?'),
+  setThumb: db.prepare("UPDATE clips SET thumb = ? WHERE id = ? AND type = 'image'"),
   expiredImages: db.prepare(`
-    SELECT content FROM clips
+    SELECT content, thumb FROM clips
     WHERE type = 'image' AND expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
   `),
   remove: db.prepare('DELETE FROM clips WHERE id = ?'),
@@ -112,6 +136,8 @@ const statements = {
 const MAX_CONTENT_LENGTH = 1024 * 1024;
 // 单张图片上限。手机原图常见 3-6MB，8MB 足够容下未压缩的直出照片。
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+// 缩略图上限。480px 的 WebP/JPEG 正常 15-60KB，512KB 是给极端噪点照片留的余量。
+const MAX_THUMB_BYTES = 512 * 1024;
 const MAX_EXPIRES_DAYS = 30;
 const PURGE_INTERVAL_MS = 10 * 60 * 1000;
 
@@ -170,12 +196,22 @@ function normalizeExpiresAt(value) {
   return parsed.toISOString();
 }
 
+function requestedExpiry(value, days) {
+  // 新 UI 发送相对天数，避免手机与服务器时钟偏差使 30 天被误判。
+  const duration = Number(days);
+  if ([1, 7, 30].includes(duration)) return new Date(Date.now() + duration * 86400_000).toISOString();
+  return normalizeExpiresAt(value);
+}
+
 function purgeExpiredClips(reason) {
   try {
     // 先摘出过期图片的文件名：删行之后就拿不到 content 了，
     // 不先删字节的话 data/uploads 会只进不出。
     const expiredImages = statements.expiredImages.all();
-    for (const row of expiredImages) removeUploadedFile(row.content);
+    for (const row of expiredImages) {
+      removeUploadedFile(row.content);
+      removeUploadedFile(row.thumb);
+    }
 
     const info = statements.purge.run();
     if (info.changes > 0 || expiredImages.length > 0) {
@@ -196,9 +232,11 @@ purgeExpiredClips('startup');
  */
 function pruneOrphanUploads() {
   try {
-    const referenced = new Set(
-      db.prepare("SELECT content FROM clips WHERE type = 'image'").all().map(row => row.content)
-    );
+    const referenced = new Set();
+    for (const row of db.prepare("SELECT content, thumb FROM clips WHERE type = 'image'").all()) {
+      if (row.content) referenced.add(row.content);
+      if (row.thumb) referenced.add(row.thumb);
+    }
 
     let removed = 0;
     for (const name of readdirSync(uploadsDir)) {
@@ -224,11 +262,6 @@ purgeTimer.unref();
 const port = Number(process.env.PORT || 4173);
 const rootDir = resolve(process.cwd(), 'dist');
 const logDir = resolve(process.cwd(), 'logs');
-const accessPassword = process.env.ACCESS_PASSWORD || '';
-const secretPath = (process.env.SECRET_PATH || process.env.VITE_SECRET_PATH || '')
-  .replace(/^\/+|\/+$/g, '')
-  .toLowerCase();
-
 mkdirSync(logDir, { recursive: true });
 
 // ---------------------------------------------------------------------------
@@ -237,20 +270,14 @@ mkdirSync(logDir, { recursive: true });
 // 目标：密码可以设得很复杂，但同设备只需输入一次。
 // - 会话 Cookie 的值由 HMAC(密码 + 入口路径) 派生，不含明文密码
 // - 改密码后派生值随之变化，所有旧 Cookie 立即失效
-// - 一次性登录链接（?k=）用于手机首次登录，省去在手机上敲密码
 // ---------------------------------------------------------------------------
 const SESSION_COOKIE = 'vclip_session';
 const SESSION_MAX_AGE_SECONDS = 365 * 24 * 60 * 60;
 
-function deriveKey(purpose) {
-  if (!accessPassword) return '';
-  return createHmac('sha256', `${accessPassword}|${secretPath}`)
-    .update(purpose)
-    .digest('base64url');
-}
-
-const sessionValue = deriveKey('session-v1');
-const loginKey = deriveKey('login-v1');
+// 升级会话版本，使旧免密链接签发的 Cookie 也必须重新验证密码。
+const sessionValue = createHmac('sha256', `${accessPassword}|${secretPath}`)
+  .update('session-v2')
+  .digest('base64url');
 
 function safeEqual(a, b) {
   const left = Buffer.from(String(a ?? ''));
@@ -279,72 +306,142 @@ const mimeTypes = {
   '.woff2': 'font/woff2',
 };
 
-// 本机地址集合：回环 + 本机各网卡地址。
-// 只有「对端地址属于本机」的请求，才可能是同机运行的反向代理（cloudflared
-// 隧道默认就是 127.0.0.1 → 4173），这类请求的代理头才有采信的价值。
-const localAddresses = new Set(['127.0.0.1', '::1']);
-for (const entries of Object.values(networkInterfaces())) {
-  for (const entry of entries || []) {
-    if (entry?.address) localAddresses.add(entry.address.replace(/^::ffff:/, ''));
+// ---------------------------------------------------------------------------
+// 静态资源传输层：压缩 + 强缓存 + ETag
+//
+// 按扩展名压缩并缓存，浏览器可复用带哈希的产物和协商缓存。
+// ---------------------------------------------------------------------------
+const COMPRESSIBLE_EXTS = new Set([
+  '.html', '.js', '.mjs', '.css', '.json', '.webmanifest', '.svg', '.txt', '.map',
+]);
+
+const staticCache = new Map();
+const MAX_STATIC_CACHE_ENTRIES = 48;
+
+function pickEncoding(req) {
+  const accept = String(req.headers['accept-encoding'] || '').toLowerCase();
+  if (accept.includes('br')) return 'br';
+  if (accept.includes('gzip')) return 'gzip';
+  return 'identity';
+}
+
+/**
+ * 读文件并（按需）压缩，结果按 path+mtime+encoding 缓存。
+ * 文件被替换（mtime 变化）时旧的 key 自然不再命中。
+ */
+function loadStaticAsset(filePath, ext, encoding) {
+  const stat = statSync(filePath);
+  const key = `${filePath}|${stat.mtimeMs}|${encoding}`;
+
+  const cached = staticCache.get(key);
+  if (cached) return cached;
+
+  let body = readFileSync(filePath);
+  let usedEncoding = 'identity';
+
+  if (encoding !== 'identity' && COMPRESSIBLE_EXTS.has(ext) && body.length >= 1024) {
+    try {
+      body = encoding === 'br'
+        ? brotliCompressSync(body, {
+          params: {
+            [zlibConstants.BROTLI_PARAM_QUALITY]: 5,
+            [zlibConstants.BROTLI_PARAM_SIZE_HINT]: body.length,
+          },
+        })
+        : gzipSync(body, { level: 6 });
+      usedEncoding = encoding;
+    } catch {
+      // 压缩失败就退回明文，不能因此让请求挂掉
+      body = readFileSync(filePath);
+      usedEncoding = 'identity';
+    }
+  }
+
+  const entry = {
+    body,
+    encoding: usedEncoding,
+    // 以 mtime + size 生成弱 ETag：内容变了必然变，不必读全文算哈希
+    etag: `W/"${stat.size.toString(16)}-${Math.floor(stat.mtimeMs).toString(16)}"`,
+    lastModified: stat.mtime.toUTCString(),
+  };
+
+  // 粗暴但够用的淘汰：条目极少，满了直接清空重来
+  if (staticCache.size >= MAX_STATIC_CACHE_ENTRIES) staticCache.clear();
+  staticCache.set(key, entry);
+
+  return entry;
+}
+
+/**
+ * 图标版本号：用文件 mtime 的 36 进制。
+ * manifest 是动态生成的，把版本塞进图标 URL，换图后 URL 自动变化，
+ * 图标替换后浏览器会重新加载。
+ */
+function assetVersion(name) {
+  try {
+    return Math.floor(statSync(join(rootDir, name)).mtimeMs).toString(36);
+  } catch {
+    return '0';
   }
 }
 
-function stripIpPrefix(ip) {
-  return String(ip || '').trim().replace(/^::ffff:/, '');
+/**
+ * 缓存策略：
+ * - /assets/ 下是 Vite 带 hash 的产物，内容恒定 → 一年 immutable
+ * - HTML 是入口，改了就必须让客户端看见 → no-cache（每次协商）
+ * - manifest 单独鉴权并设置 no-store
+ * - 图标等杂项 → 一周
+ */
+function cacheControlFor(urlPath, ext) {
+  if (urlPath.startsWith('/assets/')) return 'public, max-age=31536000, immutable';
+  if (ext === '.html' || ext === '.webmanifest') return 'no-cache';
+  return 'public, max-age=604800';
 }
 
-// 取「可信的客户端地址」：
-// - 普通直连（含局域网设备）：一律用 socket 对端地址，转发头一概不采信 —— 头部
-//   任何客户端都能伪造，采信它等于让公网访客自称内网。
-// - 对端是本机时（反向代理 / 隧道）：采信代理写入的真实客户端地址，否则代理会把
-//   所有公网访客都变成 127.0.0.1，从而错误命中局域网免密。
-//   优先 CF-Connecting-IP（Cloudflare 隧道必定写入且不可由外部覆盖），其次 XFF。
+function sendStaticAsset(req, res, urlPath, filePath, ext) {
+  let entry;
+  try {
+    entry = loadStaticAsset(filePath, ext, pickEncoding(req));
+  } catch {
+    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Not found');
+    return;
+  }
+
+  const headers = {
+    'Content-Type': mimeTypes[ext] || 'application/octet-stream',
+    'Content-Length': entry.body.length,
+    'Cache-Control': cacheControlFor(urlPath, ext),
+    'ETag': entry.etag,
+    'Last-Modified': entry.lastModified,
+    'X-Content-Type-Options': 'nosniff',
+    'Vary': 'Accept-Encoding',
+  };
+
+  if (entry.encoding !== 'identity') headers['Content-Encoding'] = entry.encoding;
+
+  const inm = req.headers['if-none-match'];
+  const ims = req.headers['if-modified-since'];
+  if (
+    (typeof inm === 'string' && inm.split(',').some(tag => tag.trim() === entry.etag)) ||
+    (!inm && typeof ims === 'string' && ims === entry.lastModified)
+  ) {
+    res.writeHead(304, headers);
+    res.end();
+    return;
+  }
+
+  res.writeHead(200, headers);
+  if (req.method === 'HEAD') {
+    res.end();
+    return;
+  }
+  res.end(entry.body);
+}
+
+// 仅内网直连，不读取任何反向代理头。
 function getClientIp(req) {
-  const socketIp = stripIpPrefix(req.socket.remoteAddress);
-  if (!localAddresses.has(socketIp)) return socketIp || 'unknown';
-
-  const cfIp = stripIpPrefix(req.headers['cf-connecting-ip']);
-  if (cfIp) return cfIp;
-
-  const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0];
-  const forwardedIp = stripIpPrefix(forwarded);
-  if (forwardedIp) return forwardedIp;
-
-  return socketIp;
-}
-
-// ---------------------------------------------------------------------------
-// 局域网免密
-//
-// VR 头显、手机这类设备打字成本极高。开启后，来自局域网私有地址的请求
-// 直接放行，不需要密码也不需要入口路径，头显里存一个 http://IP:端口 书签即用。
-//
-// 判定依据是「可信的客户端地址」（见 getClientIp）：直连时即 socket 对端地址，
-// 不接受任何转发头（可被客户端伪造）；仅当对端是本机（同机反向代理 / 隧道）时，
-// 才采用代理写入的真实客户端地址 —— 否则 cloudflared 会把全部公网访客都变成
-// 127.0.0.1，隧道反而成了免密后门。
-// ---------------------------------------------------------------------------
-const lanFreeAccess = (process.env.LAN_FREE_ACCESS || '').toLowerCase() === 'true';
-
-function isPrivateAddress(ip) {
-  if (!ip) return false;
-  if (ip === '127.0.0.1' || ip === '::1') return true;
-  if (ip.startsWith('10.')) return true;
-  if (ip.startsWith('192.168.')) return true;
-  if (ip.startsWith('169.254.')) return true;
-
-  const match = ip.match(/^172\.(\d{1,3})\./);
-  if (match) {
-    const second = Number(match[1]);
-    return second >= 16 && second <= 31;
-  }
-
-  return false;
-}
-
-function isLanTrusted(req) {
-  if (!lanFreeAccess) return false;
-  return isPrivateAddress(getClientIp(req));
+  return String(req.socket.remoteAddress || 'unknown').replace(/^::ffff:/, '');
 }
 
 function getLocalDateStamp(date = new Date()) {
@@ -382,16 +479,8 @@ const NOT_FOUND_HTML = `<!DOCTYPE html>
 </html>`;
 
 function sendNotFoundPage(res) {
-  res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' });
+  res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
   res.end(NOT_FOUND_HTML);
-}
-
-function matchesSecretPath(urlPath) {
-  if (!secretPath) return true;
-  if (!isPageRequest(urlPath)) return true;
-
-  const firstSegment = urlPath.replace(/^\/+/, '').split('/')[0].toLowerCase();
-  return firstSegment === secretPath;
 }
 
 function logAccess(req, urlPath, statusCode) {
@@ -443,80 +532,42 @@ function parseCookies(req) {
   return cookies;
 }
 
-function isSecureRequest(req) {
-  if (req.socket.encrypted) return true;
-  const forwarded = String(req.headers['x-forwarded-proto'] || '');
-  return forwarded.split(',')[0].trim() === 'https';
-}
-
-function buildSessionCookie(req) {
-  const secure = isSecureRequest(req) ? '; Secure' : '';
+function buildSessionCookie() {
   return `${SESSION_COOKIE}=${encodeURIComponent(sessionValue)}; Path=/; `
-    + `Max-Age=${SESSION_MAX_AGE_SECONDS}; HttpOnly; SameSite=Lax${secure}`;
+    + `Max-Age=${SESSION_MAX_AGE_SECONDS}; HttpOnly; SameSite=Lax`;
 }
 
-function buildLogoutCookie(req) {
-  const secure = isSecureRequest(req) ? '; Secure' : '';
-  return `${SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax${secure}`;
+function buildLogoutCookie() {
+  return `${SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax`;
 }
 
-// 认证通过的条件（任一满足）：
-// 1. Cookie 会话有效 —— 浏览器日常访问走这条，无需重复输密码
-// 2. HTTP Basic Auth 有效 —— 保留给 curl、file-share-server 等程序化调用
-function isAuthenticated(req) {
-  if (!accessPassword) return true;
-
-  const credentials = parseBasicAuth(req.headers.authorization);
-  if (credentials && safeEqual(credentials.password, accessPassword)) {
-    return true;
-  }
-
+function isAuthenticated(req, allowBasic = false) {
   const cookies = parseCookies(req);
-  if (cookies[SESSION_COOKIE] && safeEqual(cookies[SESSION_COOKIE], sessionValue)) {
-    return true;
-  }
-
-  return false;
+  if (safeEqual(cookies[SESSION_COOKIE], sessionValue)) return true;
+  // Basic Auth 仅保留给 API 联动；页面和 manifest 必须先进行密码登录。
+  const credentials = allowBasic ? parseBasicAuth(req.headers.authorization) : null;
+  return Boolean(credentials && safeEqual(credentials.password, accessPassword));
 }
 
 function sendUnauthorized(res) {
   res.writeHead(401, {
     'Content-Type': 'text/plain; charset=utf-8',
     'WWW-Authenticate': 'Basic realm="Vclip", charset="UTF-8"',
+    'Cache-Control': 'no-store',
   });
   res.end('Authentication required');
 }
 
 function redirect(res, location, extraHeaders = {}) {
-  res.writeHead(302, { Location: location, ...extraHeaders });
+  res.writeHead(302, { Location: location, 'Cache-Control': 'no-store', ...extraHeaders });
   res.end();
 }
 
-// 只允许站内相对路径，避免登录后被重定向到外部站点
-function safeRedirectTarget(raw) {
-  if (typeof raw !== 'string' || !raw.startsWith('/') || raw.startsWith('//')) {
-    return '/';
-  }
-  return raw;
-}
-
 function readRawBody(req) {
-  return new Promise((resolve, reject) => {
-    let body = '';
-    req.on('data', chunk => {
-      body += chunk.toString();
-      if (body.length > 8192) {
-        reject(new Error('Body too large'));
-        req.destroy();
-      }
-    });
-    req.on('end', () => resolve(body));
-    req.on('error', reject);
-  });
+  return readBinaryBody(req, 8192).then(body => body.toString('utf8'));
 }
 
-function sendLoginPage(res, nextPath, hasError) {
-  const next = escapeHtml(nextPath || '');
+function sendLoginPage(res, hasError = false, statusCode = 200) {
   const errorBlock = hasError
     ? '<p class="err">密码不正确，请重试</p>'
     : '';
@@ -526,6 +577,12 @@ function sendLoginPage(res, nextPath, hasError) {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
 <title>Vclip</title>
+<meta name="theme-color" content="#0B0A14">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Vclip">
+<!-- 图标可公开；登录前不请求包含入口的 manifest。 -->
+<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon-180.png">
+<link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png">
 <style>
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
@@ -556,77 +613,39 @@ function sendLoginPage(res, nextPath, hasError) {
 </style>
 </head>
 <body>
-  <form class="card" method="POST" action="/__login">
+  <form class="card" method="POST">
     <h1>Vclip</h1>
     ${errorBlock}
     <input type="password" name="password" placeholder="访问密码"
            autocomplete="current-password" autofocus required>
-    <input type="hidden" name="next" value="${next}">
     <button type="submit">进入</button>
     <p class="tip">登录后本设备一年内免密。</p>
   </form>
 </body>
 </html>`;
 
-  res.writeHead(200, {
+  res.writeHead(statusCode, {
     'Content-Type': 'text/html; charset=utf-8',
     'Cache-Control': 'no-store',
+    'Referrer-Policy': 'no-referrer',
   });
   res.end(html);
 }
 
-function escapeHtml(value) {
-  return String(value).replace(/[&<>"']/g, ch => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-  }[ch]));
-}
-
-async function handleLoginRoute(req, res, requestUrl) {
-  if (!accessPassword) {
-    redirect(res, '/');
-    return;
-  }
-
-  if (req.method === 'GET') {
-    // 已登录时不必再看登录页
-    if (isAuthenticated(req)) {
-      redirect(res, safeRedirectTarget(requestUrl.searchParams.get('next') || '/'));
-      return;
-    }
-    sendLoginPage(
-      res,
-      requestUrl.searchParams.get('next') || '',
-      requestUrl.searchParams.get('error') === '1',
-    );
-    return;
-  }
-
-  if (req.method !== 'POST') {
-    sendUnauthorized(res);
-    return;
-  }
-
+async function handleLogin(req, res) {
   let body;
   try {
     body = await readRawBody(req);
-  } catch {
-    redirect(res, '/__login?error=1');
+  } catch (error) {
+    sendJSON(res, error.status || 400, { error: 'Invalid login request' });
     return;
   }
-
-  const params = new URLSearchParams(body);
-  const password = params.get('password') || '';
-  const next = safeRedirectTarget(params.get('next') || '/');
-
+  const password = new URLSearchParams(body).get('password') || '';
   if (!safeEqual(password, accessPassword)) {
-    console.log('[Auth] Login failed (wrong password)');
-    const nextParam = next === '/' ? '' : `&next=${encodeURIComponent(next)}`;
-    redirect(res, `/__login?error=1${nextParam}`);
+    sendLoginPage(res, true, 401);
     return;
   }
-
-  console.log('[Auth] Login succeeded, session cookie issued');
-  redirect(res, next, { 'Set-Cookie': buildSessionCookie(req) });
+  redirect(res, `/${secretPath}`, { 'Set-Cookie': buildSessionCookie() });
 }
 
 function safeFilePath(urlPath) {
@@ -642,79 +661,18 @@ function safeFilePath(urlPath) {
 }
 
 function sendJSON(res, statusCode, data) {
-  res.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.writeHead(statusCode, {
+    'Content-Type': 'application/json; charset=utf-8',
+    // 剪贴板内容不写入浏览器或中间层缓存。
+    'Cache-Control': 'no-store',
+  });
   res.end(JSON.stringify(data));
-}
-
-function getRequestBody(req) {
-  return new Promise((resolve, reject) => {
-    let body = '';
-    req.on('data', chunk => {
-      body += chunk.toString();
-    });
-    req.on('end', () => {
-      try {
-        resolve(body ? JSON.parse(body) : {});
-      } catch (err) {
-        reject(err);
-      }
-    });
-    req.on('error', err => {
-      reject(err);
-    });
-  });
-}
-
-/**
- * 收原始二进制（不是 multipart）。
- * 超限后不再缓存数据但把请求读完：直接 destroy 会掐断连接，
- * 413 就发不回去了，前端的错误提示会变成「网络错误」。
- */
-function readBinaryBody(req, maxBytes) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let size = 0;
-    let overflow = false;
-    let settled = false;
-
-    req.on('data', chunk => {
-      if (settled) return;
-
-      size += chunk.length;
-      if (size > maxBytes) {
-        overflow = true;
-        chunks.length = 0;
-        return;
-      }
-
-      if (!overflow) chunks.push(chunk);
-    });
-
-    req.on('end', () => {
-      if (settled) return;
-      settled = true;
-
-      if (overflow) {
-        const err = new Error('Payload too large');
-        err.code = 'ETOOLARGE';
-        reject(err);
-        return;
-      }
-
-      resolve(Buffer.concat(chunks));
-    });
-
-    req.on('error', err => {
-      if (settled) return;
-      settled = true;
-      reject(err);
-    });
-  });
 }
 
 async function handleClipsApi(req, res, urlPath) {
   try {
     const method = req.method;
+    if (await handleDiscussion(req, res, urlPath, sendJSON)) return;
 
     if (method === 'GET' && urlPath === '/api/clips') {
       try {
@@ -754,7 +712,67 @@ async function handleClipsApi(req, res, urlPath) {
         'Cache-Control': 'private, max-age=31536000, immutable',
         'X-Content-Type-Options': 'nosniff',
       });
-      createReadStream(filePath).pipe(res);
+      createReadStream(filePath).on('error', () => res.destroy()).pipe(res);
+      return;
+    }
+
+    // 缩略图：跟原图分两次请求。
+    // 不塞进 POST /api/clips 那一次，是为了不改动它的原始二进制协议
+    // （配套的 fastapi 项目也在用），也省掉手写 multipart 解析。
+    // 前端拿不到缩略图不影响主流程：列表会回退去加载原图。
+    const thumbMatch = urlPath.match(/^\/api\/clips\/(\d+)\/thumb$/);
+    if (method === 'POST' && thumbMatch) {
+      const id = Number(thumbMatch[1]);
+
+      const target = Number.isInteger(id) && id > 0 ? statements.getById.get(id) : null;
+      if (!target || target.type !== 'image') {
+        sendJSON(res, 404, { error: 'Not found' });
+        req.resume();
+        return;
+      }
+
+      const declared = Number(req.headers['content-length'] || 0);
+      if (Number.isFinite(declared) && declared > MAX_THUMB_BYTES) {
+        sendJSON(res, 413, { error: 'Thumbnail too large', maxBytes: MAX_THUMB_BYTES });
+        req.resume();
+        return;
+      }
+
+      let buf;
+      try {
+        buf = await readBinaryBody(req, MAX_THUMB_BYTES);
+      } catch (err) {
+        if (err.status === 413) {
+          sendJSON(res, 413, { error: 'Thumbnail too large', maxBytes: MAX_THUMB_BYTES });
+          return;
+        }
+        throw err;
+      }
+
+      const kind = detectImageType(buf);
+      if (!kind) {
+        sendJSON(res, 415, { error: 'Unsupported image type' });
+        return;
+      }
+
+      const thumbName = `${Date.now().toString(36)}-${randomUUID()}-t.${kind}`;
+      writeFileSync(join(uploadsDir, thumbName), buf);
+
+      try {
+        const info = statements.setThumb.run(thumbName, id);
+        if (info.changes === 0) throw new Error('clip vanished');
+      } catch (dbError) {
+        removeUploadedFile(thumbName);
+        throw dbError;
+      }
+
+      // 重试上传时把上一张删掉，别在 uploads 里堆孤儿
+      if (target.thumb && target.thumb !== thumbName) removeUploadedFile(target.thumb);
+
+      console.log(
+        `[API] POST /api/clips/${id}/thumb - Stored ${kind.toUpperCase()} ${buf.length}B as ${thumbName}`
+      );
+      sendJSON(res, 201, { id, thumb: thumbName });
       return;
     }
 
@@ -776,7 +794,7 @@ async function handleClipsApi(req, res, urlPath) {
         try {
           buf = await readBinaryBody(req, MAX_IMAGE_BYTES);
         } catch (err) {
-          if (err.code === 'ETOOLARGE') {
+          if (err.status === 413) {
             sendJSON(res, 413, { error: 'Image too large', maxBytes: MAX_IMAGE_BYTES });
             return;
           }
@@ -789,8 +807,8 @@ async function handleClipsApi(req, res, urlPath) {
           return;
         }
 
-        const queryExpires = new URL(req.url || '/', 'http://localhost').searchParams.get('expires_at');
-        const expiresAt = normalizeExpiresAt(queryExpires || '');
+        const query = new URL(req.url || '/', 'http://localhost').searchParams;
+        const expiresAt = requestedExpiry(query.get('expires_at'), query.get('retention_days'));
 
         const filename = `${Date.now().toString(36)}-${randomUUID()}.${kind}`;
         writeFileSync(join(uploadsDir, filename), buf);
@@ -809,7 +827,7 @@ async function handleClipsApi(req, res, urlPath) {
         return;
       }
 
-      const body = await getRequestBody(req);
+      const body = await readJSONBody(req);
       const content = body.content;
       if (typeof content !== 'string' || !content.trim()) {
         sendJSON(res, 400, { error: 'Content is required' });
@@ -822,7 +840,7 @@ async function handleClipsApi(req, res, urlPath) {
         return;
       }
 
-      const expiresAt = normalizeExpiresAt(body.expires_at);
+      const expiresAt = requestedExpiry(body.expires_at, body.retention_days);
 
       try {
         const row = expiresAt
@@ -849,7 +867,10 @@ async function handleClipsApi(req, res, urlPath) {
         const target = statements.getById.get(id);
         const info = statements.remove.run(id);
         // 删行之后才删文件：万一 unlink 失败，至少还能从数据库里找回文件名
-        if (target && target.type === 'image') removeUploadedFile(target.content);
+        if (target && target.type === 'image') {
+          removeUploadedFile(target.content);
+          removeUploadedFile(target.thumb);
+        }
         console.log(`[API] DELETE /api/clips/${id} - Removed ${info.changes} row(s)`);
         sendJSON(res, 200, { success: true, deleted: info.changes });
       } catch (deleteError) {
@@ -862,35 +883,84 @@ async function handleClipsApi(req, res, urlPath) {
     sendJSON(res, 404, { error: 'Not found' });
   } catch (error) {
     console.error('API Error:', error);
-    sendJSON(res, 500, { error: 'Internal server error' });
+    if (!res.headersSent && !res.destroyed) {
+      sendJSON(res, error.status || 500, { error: error.status ? error.message : 'Internal server error' });
+    }
   }
 }
 
 const server = createServer((req, res) => {
-  const requestUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
-  const urlPath = decodeURIComponent(requestUrl.pathname);
+  let requestUrl;
+  let urlPath;
+  try {
+    requestUrl = new URL(req.url || '/', 'http://localhost');
+    urlPath = decodeURIComponent(requestUrl.pathname);
+  } catch {
+    req.resume();
+    sendJSON(res, 400, { error: 'Invalid URL' });
+    return;
+  }
 
   res.on('finish', () => logAccess(req, urlPath, res.statusCode));
 
-  // 登录 / 登出路由必须在鉴权之前处理
-  if (urlPath === '/__login') {
-    handleLoginRoute(req, res, requestUrl).catch(err => {
-      console.error('[Auth] Login handler error:', err);
-      if (!res.headersSent) sendUnauthorized(res);
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  const isEntry = urlPath === `/${secretPath}` || urlPath === `/${secretPath}/`;
+  const isApiPath = urlPath.startsWith('/api/');
+  const isManifest = urlPath === '/manifest.webmanifest';
+  const isAsset = urlPath.startsWith('/assets/');
+  const isPublicIcon = /^\/(icon\.svg|icon-maskable\.svg|icon-192\.png|icon-512\.png|icon-maskable-512\.png|apple-touch-icon(-180)?(-precomposed)?\.png|favicon\.(svg|ico))$/.test(urlPath);
+  const isLogout = urlPath === '/__logout';
+
+  // 先校验路由，错误入口即使带有效 Cookie 也不能进入页面。
+  if (!isEntry && !isApiPath && !isManifest && !isAsset && !isPublicIcon && !isLogout) {
+    req.resume();
+    sendNotFoundPage(res);
+    return;
+  }
+
+  if (isEntry && req.method === 'POST') {
+    handleLogin(req, res).catch(error => {
+      console.error('[Auth] Login failed:', error.message);
+      if (!res.headersSent && !res.destroyed) sendJSON(res, 500, { error: 'Login failed' });
     });
     return;
   }
 
-  if (urlPath === '/__logout') {
-    redirect(res, '/__login', { 'Set-Cookie': buildLogoutCookie(req) });
+  if (isEntry && !['GET', 'HEAD'].includes(req.method)) {
+    req.resume();
+    res.writeHead(405, { Allow: 'GET, HEAD, POST', 'Cache-Control': 'no-store' });
+    res.end();
+    return;
+  }
+
+  if (!isPublicIcon && !isAuthenticated(req, isApiPath)) {
+    req.resume();
+    if (isEntry) sendLoginPage(res);
+    else if (isManifest) sendJSON(res, 401, { error: 'Authentication required' });
+    else sendUnauthorized(res);
+    return;
+  }
+
+  if (isLogout) {
+    redirect(res, `/${secretPath}`, { 'Set-Cookie': buildLogoutCookie() });
+    return;
+  }
+
+  if (isApiPath) {
+    handleClipsApi(req, res, urlPath);
     return;
   }
 
   // PWA manifest：动态生成，让 start_url 始终指向真实入口路径
   // （静态文件无法知道 SECRET_PATH，写死会让主屏幕图标打开 / 直接 404）
-  if (urlPath === '/manifest.webmanifest') {
-    const startUrl = secretPath ? `/${secretPath}` : '/';
-    res.writeHead(200, { 'Content-Type': 'application/manifest+json; charset=utf-8' });
+  if (isManifest) {
+    const startUrl = `/${secretPath}`;
+    res.writeHead(200, {
+      'Content-Type': 'application/manifest+json; charset=utf-8',
+      // 只有通过密码登录的浏览器可读取，含隐藏入口，禁止缓存。
+      'Cache-Control': 'private, no-store',
+      'Vary': 'Cookie',
+    });
     res.end(JSON.stringify({
       id: startUrl,
       name: 'Vclip',
@@ -902,67 +972,15 @@ const server = createServer((req, res) => {
       orientation: 'any',
       background_color: '#0B0A14',
       theme_color: '#0B0A14',
+      // 只放 PNG：iOS 对 manifest 里的 SVG 图标支持不一致，
+      // 混着放会让部分版本挑到不认识的格式，最后退回灰图标。
+      // URL 带 mtime 版本号，换图即自动失效边缘缓存。
       icons: [
-        { src: '/icon.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'any' },
-        { src: '/icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
-        { src: '/icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
-        { src: '/icon-maskable-512.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' },
+        { src: `/icon-192.png?v=${assetVersion('icon-192.png')}`, sizes: '192x192', type: 'image/png', purpose: 'any' },
+        { src: `/icon-512.png?v=${assetVersion('icon-512.png')}`, sizes: '512x512', type: 'image/png', purpose: 'any' },
+        { src: `/icon-maskable-512.png?v=${assetVersion('icon-maskable-512.png')}`, sizes: '512x512', type: 'image/png', purpose: 'maskable' },
       ],
     }));
-    return;
-  }
-
-  const lanTrusted = isLanTrusted(req);
-  const onSecretPath = matchesSecretPath(urlPath);
-  // 所有 /api/ 前缀都走同一条鉴权通道。
-  // 这里必须用前缀匹配而不是逐个枚举：漏放行一个前缀（比如 /api/media/），
-  // 局域网免密下的图片加载就会被 401 拦掉，页面出现一排破图。
-  const isApiPath = urlPath.startsWith('/api/');
-
-  // 图标类资源免鉴权：iOS / 浏览器可能在登录前或未带 Cookie 时抓取它们，
-  // 若被 401 拦下，加到主屏幕只会得到一个灰底问号。图标本身不是敏感信息。
-  const isPublicAsset = /^\/(icon\.svg|icon-192\.png|icon-512\.png|icon-maskable-512\.png|apple-touch-icon(-precomposed)?\.png|favicon\.(svg|ico))$/.test(urlPath);
-
-  // 局域网免密只在「入口路径 + 接口 + 静态资源」上生效，普通页面（尤其 /）仍然要密码。
-  // 这样开启免密后，站点对外仍表现为「一个需要密码的站」，
-  // 入口路径不会被顺手暴露出去，攻击者也无从猜到还有隐藏路径。
-  const lanBypass = (lanTrusted && (onSecretPath || isApiPath)) || isPublicAsset;
-
-  if (!lanBypass && !isAuthenticated(req)) {
-    // 一次性登录链接：手机首次访问时带上 ?k=xxx，免去在小屏上敲密码
-    const loginParam = requestUrl.searchParams.get('k');
-    if (loginParam && loginKey && safeEqual(loginParam, loginKey)) {
-      const cleanUrl = new URL(requestUrl);
-      cleanUrl.searchParams.delete('k');
-      console.log('[Auth] Login link accepted, session cookie issued');
-      redirect(res, urlPath + cleanUrl.search, { 'Set-Cookie': buildSessionCookie(req) });
-      return;
-    }
-
-    console.log(`[Auth] Unauthenticated request to ${urlPath}`);
-
-    // API 保持 401 + WWW-Authenticate，兼容 curl 与 file-share-server 的程序化调用
-    if (isApiPath || !isPageRequest(urlPath)) {
-      sendUnauthorized(res);
-      return;
-    }
-
-    // 页面请求改为跳转登录页，不再弹浏览器的原生 Basic Auth 框
-    const nextParam = urlPath === '/' ? '' : `?next=${encodeURIComponent(urlPath)}`;
-    redirect(res, `/__login${nextParam}`);
-    return;
-  }
-
-  if (isApiPath) {
-    handleClipsApi(req, res, urlPath);
-    return;
-  }
-
-  // 入口路径校验对任何来源都生效（含局域网免密设备）：
-  // 免密只是免掉密码，不是免掉入口路径，/ 依然返回 404。
-  if (!onSecretPath) {
-    console.log(`[Security] Blocked ${urlPath} (secret path mismatch)`);
-    sendNotFoundPage(res);
     return;
   }
 
@@ -972,8 +990,7 @@ const server = createServer((req, res) => {
     return;
   }
 
-  const filePath = safeFilePath(urlPath);
-  const indexPath = join(rootDir, 'index.html');
+  const filePath = isEntry ? join(rootDir, 'index.html') : safeFilePath(urlPath);
   let targetPath = filePath;
 
   if (!targetPath) {
@@ -987,28 +1004,13 @@ const server = createServer((req, res) => {
   }
 
   if (!existsSync(targetPath)) {
-    if (isPageRequest(urlPath)) {
-      targetPath = indexPath;
-    } else {
-      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
-      res.end('Not found');
-      return;
-    }
+    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.end('Not found');
+    return;
   }
 
-  const ext = extname(targetPath);
-  const contentType = mimeTypes[ext] || 'application/octet-stream';
-  res.writeHead(200, { 'Content-Type': contentType });
-
-  const stream = createReadStream(targetPath);
-  stream.on('error', () => {
-    if (!res.headersSent) {
-      res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
-    }
-    res.end('Internal server error');
-  });
-
-  stream.pipe(res);
+  const ext = extname(targetPath).toLowerCase();
+  sendStaticAsset(req, res, urlPath, targetPath, ext);
 });
 
 function getLanAddresses() {
@@ -1028,45 +1030,11 @@ server.listen(port, () => {
   console.log(`SQLite database: ${dbPath}`);
   console.log(`Access logs: ${join(logDir, 'access-YYYY-MM-DD.log')}`);
 
-  if (!secretPath) {
-    console.warn('[Warn] SECRET_PATH is empty, every page path is reachable.');
-  } else {
-    console.log(`Entry: http://localhost:${port}/${secretPath}`);
-    for (const address of getLanAddresses()) {
-      console.log(`   LAN: http://${address}:${port}/${secretPath}`);
-    }
+  console.log(`Entry: http://localhost:${port}/${secretPath}`);
+  for (const address of getLanAddresses()) {
+    console.log(`   LAN: http://${address}:${port}/${secretPath}`);
   }
-
-  if (lanFreeAccess) {
-    console.log('');
-    if (secretPath) {
-      console.log('局域网免密已开启 —— 同网段设备访问入口路径直接进入，无需密码:');
-      for (const address of getLanAddresses()) {
-        console.log(`   http://${address}:${port}/${secretPath}`);
-      }
-      console.log('首页 / 及其他路径仍然要求密码，站点对外仍是「需要密码」的形态。');
-    } else {
-      console.log('局域网免密已开启 —— 未设置 SECRET_PATH，同网段设备可访问全部页面:');
-      for (const address of getLanAddresses()) {
-        console.log(`   http://${address}:${port}/`);
-      }
-    }
-    console.log('VR 头显把上面的入口路径存成书签即可，零输入进入。');
-    console.log('非局域网来源（公网）仍需密码 + 入口路径。');
-  }
-
-  if (accessPassword) {
-    const suffixes = [`localhost:${port}`, ...getLanAddresses().map(a => `${a}:${port}`)];
-    console.log('');
-    console.log('免密登录链接（手机首次访问用，之后一年内免密）:');
-    for (const suffix of suffixes) {
-      const path = secretPath ? `/${secretPath}` : '/';
-      console.log(`   http://${suffix}${path}?k=${loginKey}`);
-    }
-    console.log('修改 ACCESS_PASSWORD 会让所有已登录设备立即失效。');
-  } else {
-    console.warn('[Warn] ACCESS_PASSWORD is empty, authentication is DISABLED.');
-  }
+  console.log('首次访问需输入密码；修改 ACCESS_PASSWORD 后所有设备需重新登录。');
 });
 
 function shutdown(signal) {
