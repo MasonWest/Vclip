@@ -8,6 +8,19 @@ import { isImageFile } from './utils/images';
 import { ClipPrompt } from './components/ClipPrompt';
 import { copyText } from './utils/clipboard';
 
+/** 拖拽携带 DownloadURL 时需要 MIME，服务端只收这几种格式 */
+const MIME_BY_EXT: Record<string, string> = {
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  gif: 'image/gif',
+  webp: 'image/webp',
+};
+
+const mimeFromName = (name: string) =>
+  MIME_BY_EXT[name.slice(name.lastIndexOf('.') + 1).toLowerCase()] || 'application/octet-stream';
+
+
 export default function CloudClipboard() {
   const [input, setInput] = useState('');
   const [copiedId, setCopiedId] = useState<number | null>(null);
@@ -18,6 +31,8 @@ export default function CloudClipboard() {
   const [previewError, setPreviewError] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [retentionDays, setRetentionDays] = useState(1);
+  /** 缩略图加载失败的 clip id：退回原图，避免派生文件丢失导致卡片永久破图 */
+  const [brokenThumbs, setBrokenThumbs] = useState<Set<number>>(() => new Set());
   const { clips, uploadingCount, addText, uploadFiles: queueFiles, deleteClip, setStatus, savePrompt } = useClips(setToast);
 
   const copyTimerRef = useRef<number | null>(null);
@@ -52,9 +67,31 @@ export default function CloudClipboard() {
    * 缩略图（几十 KB）→ 本地 blob（刚上传，零延迟）→ 原图（老记录没有缩略图）
    */
   const displayUrl = (clip: Clip) => {
-    if (clip.thumb) return `/api/media/${clip.thumb}`;
+    if (clip.thumb && !brokenThumbs.has(clip.id)) return `/api/media/${clip.thumb}`;
     if (clip.localUrl) return clip.localUrl;
     return mediaUrl(clip);
+  };
+
+  /**
+   * 列表里看到的是缩略图，但拖拽出口必须是原图。
+   * 浏览器原生拖拽拖的是 <img> 的 src，不做处理的话拖出去只有 480px 的缩略图。
+   * Chromium 认 `DownloadURL`（格式 `mime:filename:url`），会用自己的下载器去取这个
+   * 地址 —— Cookie 由浏览器带上，所以拖到资源管理器拿到的是完整原图。
+   */
+  const onImageDragStart = (event: React.DragEvent<HTMLImageElement>, clip: Clip) => {
+    const dataTransfer = event.dataTransfer;
+    if (!dataTransfer) return;
+
+    // pending 时 content 还是 blob: 地址，落地后再拖才有意义
+    if (clip.pending || clip.content.startsWith('blob:')) {
+      event.preventDefault();
+      return;
+    }
+
+    const url = new URL(mediaUrl(clip), window.location.origin).href;
+    dataTransfer.effectAllowed = 'copy';
+    dataTransfer.setData('DownloadURL', `${mimeFromName(clip.content)}:${clip.content}:${url}`);
+    dataTransfer.setData('text/uri-list', url);
   };
 
   const uploadFiles = useCallback((files: FileList | File[]) => {
@@ -349,13 +386,20 @@ export default function CloudClipboard() {
                             src={displayUrl(clip)}
                             alt=""
                             loading="lazy"
+                            onDragStart={event => onImageDragStart(event, clip)}
                             className="block mx-auto max-w-full max-h-[420px] w-auto h-auto opacity-0 transition-opacity duration-500"
                             onLoad={e => {
                               e.currentTarget.style.opacity = '1';
                             }}
                             onError={e => {
-                              // 文件被外部删掉时别留一块空白，至少让用户看到发生了什么
                               const el = e.currentTarget;
+                              // 缩略图是派生数据，文件丢了不该让整张卡片永久破图：
+                              // 退回原图再试一次，原图也没了才认输
+                              if (clip.thumb && !brokenThumbs.has(clip.id)) {
+                                setBrokenThumbs(prev => new Set(prev).add(clip.id));
+                                return;
+                              }
+                              // 文件被外部删掉时别留一块空白，至少让用户看到发生了什么
                               el.style.opacity = '1';
                               el.style.minHeight = '72px';
                               el.alt = '图片加载失败';
