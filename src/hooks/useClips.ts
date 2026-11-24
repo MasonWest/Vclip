@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { Clip } from '../types';
+import type { Clip, PromptSaveResult } from '../types';
 import { makeThumbnail, prepareImage } from '../utils/images';
 
 export function useClips(notify: (message: string) => void) {
@@ -158,5 +158,19 @@ export function useClips(notify: (message: string) => void) {
     finally { finish(); }
   }, [beginMutation, notify]);
 
-  return { clips, uploadingCount, addText, uploadFiles, deleteClip, setStatus };
+  const savePrompt = useCallback(async (id: number, prompt: string, prompt_version: number): Promise<PromptSaveResult> => {
+    const finish = beginMutation();
+    try {
+      const response = await fetch(`/api/clips/${id}`, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ prompt, prompt_version }),
+      });
+      const data = await response.json();
+      if (!response.ok) return { ok: false, error: data.error || '保存失败，请重试', latest: data.latest };
+      setClips(prev => prev.map(clip => clip.id === id ? { ...clip, prompt: data.prompt, prompt_version: data.prompt_version } : clip));
+      return { ok: true, value: data };
+    } catch { return { ok: false, error: '保存失败，你的草稿已保留，请重试' }; }
+    finally { finish(); }
+  }, [beginMutation]);
+
+  return { clips, uploadingCount, addText, uploadFiles, deleteClip, setStatus, savePrompt };
 }

@@ -1,11 +1,12 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Clipboard, Trash2, Check, Search, ImagePlus, Download, X, Loader2 } from 'lucide-react';
+import { Clipboard, Trash2, Check, Search, ImagePlus, Download, X, Loader2, ArrowUp } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
 import type { Clip } from './types';
 import { useClips } from './hooks/useClips';
 import { isImageFile } from './utils/images';
-import { ClipDiscussion } from './components/ClipDiscussion';
+import { ClipPrompt } from './components/ClipPrompt';
+import { copyText } from './utils/clipboard';
 
 export default function CloudClipboard() {
   const [input, setInput] = useState('');
@@ -17,7 +18,7 @@ export default function CloudClipboard() {
   const [previewError, setPreviewError] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [retentionDays, setRetentionDays] = useState(1);
-  const { clips, uploadingCount, addText, uploadFiles: queueFiles, deleteClip, setStatus } = useClips(setToast);
+  const { clips, uploadingCount, addText, uploadFiles: queueFiles, deleteClip, setStatus, savePrompt } = useClips(setToast);
 
   const copyTimerRef = useRef<number | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -129,40 +130,23 @@ export default function CloudClipboard() {
     };
   }, [uploadFiles]);
 
-  const addClip = async (event: React.KeyboardEvent<HTMLInputElement>) => {
-    if (event.key !== 'Enter' || event.nativeEvent.isComposing || !input.trim()) return;
+  /** 回车与右侧按钮共用同一条提交路径 */
+  const submitText = async () => {
     const content = input.trim();
+    if (!content) return;
     setInput('');
     if (!await addText(content, retentionDays)) setInput(current => current || content);
   };
 
-  const fallbackCopyText = (text: string) => {
-    const textArea = document.createElement('textarea');
-    textArea.value = text;
-    textArea.setAttribute('readonly', 'true');
-    textArea.style.position = 'fixed';
-    textArea.style.top = '-9999px';
-    textArea.style.left = '-9999px';
-    textArea.style.opacity = '0';
-    document.body.appendChild(textArea);
-    textArea.focus();
-    textArea.select();
-
-    const success = document.execCommand('copy');
-    document.body.removeChild(textArea);
-
-    if (!success) {
-      throw new Error('document.execCommand("copy") failed');
-    }
+  const addClip = (event: React.KeyboardEvent<HTMLInputElement>) => {
+    // isComposing：中文输入法选词时的回车不能当作提交
+    if (event.key !== 'Enter' || event.nativeEvent.isComposing) return;
+    void submitText();
   };
 
   const copyToClipboard = async (text: string, id: number) => {
     try {
-      if (navigator.clipboard && window.isSecureContext) {
-        await navigator.clipboard.writeText(text);
-      } else {
-        fallbackCopyText(text);
-      }
+      await copyText(text);
 
       setCopiedId(id);
       if (copyTimerRef.current !== null) {
@@ -230,24 +214,38 @@ export default function CloudClipboard() {
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={addClip}
-              className="w-full bg-white/[0.03] border border-white/10 rounded-2xl py-4 pl-12 pr-14 text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500/40 transition-all shadow-[0_0_30px_rgba(0,0,0,0.5)]"
+              className="w-full bg-white/[0.03] border border-white/10 rounded-2xl py-4 pl-12 pr-28 text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500/40 transition-all shadow-[0_0_30px_rgba(0,0,0,0.5)]"
             />
             <Search
               className="absolute left-4 top-1/2 -translate-y-1/2 text-zinc-500 group-focus-within:text-indigo-400 transition-colors"
               size={18}
             />
-            <button
-              type="button"
-              aria-label="上传图片"
-              onClick={() => fileInputRef.current?.click()}
-              className="absolute right-3 top-1/2 -translate-y-1/2 p-2 rounded-xl text-zinc-500 hover:text-indigo-300 hover:bg-white/[0.06] transition-all"
-            >
-              {uploadingCount > 0 ? (
-                <Loader2 size={18} className="animate-spin text-indigo-400" />
-              ) : (
-                <ImagePlus size={18} />
-              )}
-            </button>
+            <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1">
+              <button
+                type="button"
+                aria-label="上传图片"
+                onClick={() => fileInputRef.current?.click()}
+                className="p-2 rounded-xl text-zinc-500 hover:text-indigo-300 hover:bg-white/[0.06] transition-all"
+              >
+                {uploadingCount > 0 ? (
+                  <Loader2 size={18} className="animate-spin text-indigo-400" />
+                ) : (
+                  <ImagePlus size={18} />
+                )}
+              </button>
+              <button
+                type="button"
+                aria-label="同步文字"
+                title="同步文字（回车）"
+                onClick={submitText}
+                // 阻止默认的焦点转移，移动端点按钮时键盘不会收起
+                onMouseDown={event => event.preventDefault()}
+                disabled={!input.trim()}
+                className="p-2 rounded-xl bg-indigo-500 text-white shadow-[0_2px_14px_rgba(99,102,241,0.35)] hover:bg-indigo-400 active:scale-95 transition-all disabled:bg-white/[0.05] disabled:text-zinc-600 disabled:shadow-none disabled:cursor-not-allowed"
+              >
+                <ArrowUp size={18} strokeWidth={2.5} />
+              </button>
+            </div>
           </div>
 
           <div className="max-w-xl mx-auto mt-3 flex items-center justify-between gap-2 text-xs text-zinc-500">
@@ -374,7 +372,7 @@ export default function CloudClipboard() {
                           {clip.content}
                         </div>
                       )}
-                      <ClipDiscussion clip={clip} onStatus={setStatus} />
+                      <ClipPrompt clip={clip} onStatus={setStatus} onSave={savePrompt} />
                       <p className="text-[10px] text-zinc-600">保留至 {new Date(clip.expires_at).toLocaleString([], { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</p>
                     </div>
                   </div>

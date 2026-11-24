@@ -31,7 +31,7 @@ function canvasToBlob(img: HTMLImageElement, width: number, height: number, type
 }
 
 async function decodeHeic(file: File): Promise<Blob> {
-  // 按需加载本地 worker；解码不会阻塞留言输入，也不会上传到第三方。
+  // 按需加载本地 worker；解码不会阻塞提示词输入，也不会上传到第三方。
   const worker = new Worker(new URL('../workers/heic.worker.ts', import.meta.url), { type: 'module' });
   return new Promise((resolve, reject) => {
     const timer = window.setTimeout(() => finish(new Error('HEIC 转换超时，请导出为 JPG 后重试')), 90_000);

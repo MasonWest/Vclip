@@ -16,7 +16,7 @@ import { networkInterfaces } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 import { gzipSync, brotliCompressSync, constants as zlibConstants } from 'node:zlib';
 import { readBinaryBody, readJSONBody } from './server/body.mjs';
-import { createDiscussionStore } from './server/discussion.mjs';
+import { createMaterialStore } from './server/materials.mjs';
 
 function loadEnvFile(filePath) {
   if (!existsSync(filePath)) return;
@@ -92,12 +92,11 @@ db.exec(`
   }
 }
 
-const handleDiscussion = createDiscussionStore(db);
+const handleMaterial = createMaterialStore(db);
 
 const statements = {
   list: db.prepare(`
-    SELECT id, content, thumb, type, status, created_at, expires_at,
-      (SELECT count(*) FROM comments WHERE clip_id = clips.id) AS comment_count
+    SELECT id, content, thumb, type, status, prompt, prompt_version, created_at, expires_at
     FROM clips
     WHERE expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
     ORDER BY id DESC
@@ -106,19 +105,19 @@ const statements = {
   insert: db.prepare(`
     INSERT INTO clips (content)
     VALUES (?)
-    RETURNING id, content, thumb, type, status, created_at, expires_at
+    RETURNING id, content, thumb, type, status, prompt, prompt_version, created_at, expires_at
   `),
   insertWithExpiry: db.prepare(`
     INSERT INTO clips (content, expires_at)
     VALUES (?, ?)
-    RETURNING id, content, thumb, type, status, created_at, expires_at
+    RETURNING id, content, thumb, type, status, prompt, prompt_version, created_at, expires_at
   `),
   // 图片：content 存的是 data/uploads 下的文件名，不是图片本身；
   // thumb 是缩略图文件名，列表只加载它，点开大图才取 content 指向的原图
   insertImage: db.prepare(`
     INSERT INTO clips (content, type, expires_at)
     VALUES (?, 'image', COALESCE(?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+1 day')))
-    RETURNING id, content, thumb, type, status, created_at, expires_at
+    RETURNING id, content, thumb, type, status, prompt, prompt_version, created_at, expires_at
   `),
   getById: db.prepare('SELECT id, content, thumb, type FROM clips WHERE id = ?'),
   setThumb: db.prepare("UPDATE clips SET thumb = ? WHERE id = ? AND type = 'image'"),
@@ -672,7 +671,7 @@ function sendJSON(res, statusCode, data) {
 async function handleClipsApi(req, res, urlPath) {
   try {
     const method = req.method;
-    if (await handleDiscussion(req, res, urlPath, sendJSON)) return;
+    if (await handleMaterial(req, res, urlPath, sendJSON)) return;
 
     if (method === 'GET' && urlPath === '/api/clips') {
       try {
